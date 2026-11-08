@@ -49,10 +49,10 @@ node --check lib/client.js
 **必须确认没有把个人信息提交上去：**
 
 ```powershell
-git diff --cached | Select-String -Pattern 'ghp_|139\d{8}|\d{11}|C:\\Users\\'
+git diff --cached | Select-String -Pattern 'gh[pousr]_|1[3-9]\d{9}|\*\*\*\*\*|Authorization|ud_id'
 ```
 
-`*.dpapi` / `authorization.json` / `.env` 已在 `.gitignore` 里，别用 `git add -f` 绕过。
+`.dpapi` / `authorization.json` / `.env` 已在 `.gitignore` 里，别用 `git add -f` 绕过。
 
 ## 提交信息
 

@@ -3,14 +3,14 @@
 # ============================================================================
 # 宿主端（lib/index.js）注册 /api/dsh-mcloud/* 路由与移动云盘工具；
 # 客户端（lib/client.js）由 package.json 的 dsh.client 自动发现，
-# 在会话窗口顶部加一个「移动云盘」标签（order 30，排在 QQ Bot 25 右边）。
+# 在会话窗口顶部加一个「移动云盘」标签（conversation.view 槽位，order 30）。
 #
 # 默认凭据文件：~/.dsh-mcloud/authorization.dpapi（Windows DPAPI 加密）
 # 想换位置就在这里写 config：
 #   - id: dsh-mcloud
 #     name: 'dsh-mcloud'
 #     config:
-#       credentialDir: 'D:\secrets\mcloud'
+#       credentialDir: '/custom/credential/dir'
 #       enableWrites: false
 # ============================================================================
 
