@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Mobile Cloud">
+  <defs>
+    <linearGradient id="mcbg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0086d1"/>
+      <stop offset="1" stop-color="#00c2b8"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="52" height="52" rx="14" fill="url(#mcbg)"/>
+  <path d="M22.5 42.5h19.4a6.6 6.6 0 0 0 .66-13.16 9.8 9.8 0 0 0-18.86-2.4A7.9 7.9 0 0 0 22.5 42.5Z"
+        fill="#fff" opacity="0.95"/>
+  <path d="M32 32.2v-8.4M32 23.8l-3.4 3.4M32 23.8l3.4 3.4"
+        stroke="#0086d1" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <path d="M27 36.6h10" stroke="#0086d1" stroke-width="2.4" stroke-linecap="round" opacity="0.65"/>
+</svg>

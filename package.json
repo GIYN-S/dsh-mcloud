@@ -1,0 +1,50 @@
+{
+  "name": "dsh-mcloud",
+  "version": "0.1.0",
+  "private": true,
+  "description": "中国移动云盘（139）接入 DeepSeek Harness：容量查询、列目录、上传下载、转移、以及在会话页提供一个可操作的标签面板。",
+  "type": "module",
+  "main": "lib/index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "locale/*.json",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "139",
+    "mobile-cloud",
+    "china-mobile",
+    "yun139",
+    "mcp"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
