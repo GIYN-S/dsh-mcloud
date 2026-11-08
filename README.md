@@ -13,6 +13,8 @@
 > 协议参考了 [OpenList](https://github.com/OpenListTeam/OpenList)（AGPL-3.0）与
 > [cloud_driver_sdk](https://github.com/kong-hen/cloud_driver_sdk) 的实现。
 
+📖 [常见问题 FAQ](FAQ.md) · 📝 [更新日志](CHANGELOG.md) · 🤝 [贡献指南](CONTRIBUTING.md)
+
 ## 快速开始
 
 **第一次用，从登录开始：**

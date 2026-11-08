@@ -19,6 +19,9 @@
     "icon.svg",
     "cordis.patch.yml",
     "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "FAQ.md",
     "LICENSE"
   ],
   "dsh": {
