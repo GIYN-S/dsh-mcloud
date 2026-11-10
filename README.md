@@ -3,7 +3,146 @@
 把 **中国移动云盘（139）** 接进 DeepSeek Harness：在会话页顶部加一个「移动云盘」页签，
 可以直接浏览、上传、下载、转移网盘文件；同时给模型提供一整套 `mcloud_*` 工具。
 
-## ⚠️ 免责声明（请务必阅读）
+📖 [常见问题 FAQ](FAQ.md) · 📝 [更新日志](CHANGELOG.md) · 🤝 [贡献指南](CONTRIBUTING.md)
+
+## 快速开始
+
+**环境要求**
+
+| 项目 | 要求 |
+| --- | --- |
+| DeepSeek Harness | **>= 0.2.1-rc.5，< 0.4.0**（`dsh --version` 查看） |
+| Node.js | >= 22 |
+| 系统 | Windows |
+
+**五步用起来**
+
+1. 装插件（见下方「安装」）
+2. 重启 DSH —— 插件在 profile 启动时加载
+3. 会话页顶部标签栏点「**移动云盘**」
+4. 用**扫码**或**账号密码**登录（全新安装一定是未登录状态）
+5. 看到容量和文件列表 → 可以用了
+
+之后可以直接让 AI 操作网盘，也可以右键菜单自己动手。
+
+## 安装
+
+从 GitHub 装（推荐）：
+
+```powershell
+dsh plugin --profile desktop add github:GIYN-S/dsh-mcloud
+```
+
+或下载 Release 里的 tgz：
+
+```powershell
+dsh plugin --profile desktop add https://github.com/GIYN-S/dsh-mcloud/releases/download/v0.2.0/dsh-mcloud-0.2.0.tgz
+```
+
+本地开发用 link：
+
+```powershell
+dsh plugin --profile desktop add "link:/path/to/dsh-mcloud"
+```
+
+装完**重启 DSH** 才生效。
+
+## 登录
+
+打开面板会看到登录页，两种方式任选。
+
+### 扫码登录（推荐）
+
+点「**开始扫码登录**」→ 弹出一个浏览器窗口 → 手机扫码 → 完成。
+
+- 不需要输密码
+- 凭据会自动续期，日常**不需要反复扫码**
+- 弹出的是独立 profile 的浏览器，不影响你日常用的 Edge
+
+### 账号密码登录
+
+在「账号密码」页签填手机号/邮箱和密码。
+
+- **密码默认只用一次**，登录成功后立刻丢弃
+- 勾选「**记住密码**」才会保存，用 Windows DPAPI 加密存在本机
+
+### 退出登录
+
+面板里点「退出登录」，会清掉本机凭据，回到未登录状态。
+
+### 凭据存在哪
+
+`%USERPROFILE%\.dsh-mcloud\authorization.dpapi` —— 当前用户的 DPAPI 加密，
+换用户或换机器都解不开。想换位置在配置里写 `credentialDir`。
+
+**不要把凭据贴到 Issue、聊天记录或截图里。**
+
+## 功能
+
+### 面板内操作
+
+| 操作 | 说明 |
+| --- | --- |
+| 浏览目录 | 点击文件夹进入，顶部面包屑可回退 |
+| 容量 | 显示总量 / 已用 / 剩余 |
+| 上传 | 右键 → 上传文件 / 上传文件夹 / 拖动上传 |
+| 下载 | 右键 → 下载到本地 / 打开下载直链 / 下载整个文件夹 |
+| 转移 | 右键 → 转移到…（选择目标文件夹） |
+| 复制路径 | 右键 → 复制路径 |
+| 重命名 / 删除 | 右键菜单 |
+
+### 模型工具
+
+| 工具 | 用途 |
+| --- | --- |
+| `mcloud_quota` | 查询容量 |
+| `mcloud_list` | 列目录 |
+| `mcloud_search` | 按文件名搜索 |
+| `mcloud_upload` | 上传本地文件（按路径，直接从磁盘读） |
+| `mcloud_upload_folder` | 上传整个本地文件夹 |
+| `mcloud_download` | 下载到本地 |
+| `mcloud_download_folder` | 递归下载整个文件夹 |
+| `mcloud_download_link` | 获取下载直链 |
+| `mcloud_mkdir` | 新建文件夹 |
+| `mcloud_rename` | 重命名 |
+| `mcloud_move` | 转移 |
+| `mcloud_remove` | 删除（进回收站） |
+
+## 使用提醒
+
+- **大文件或整个目录**：让模型调用 `mcloud_upload`，走本机路径直传，效率最高。
+  面板里的上传需要经过浏览器中转一次。
+- **下载整个文件夹**不是压缩包：移动云盘没有打包下载接口，插件会递归遍历后逐个下载。
+- **删除进回收站**，可以在网盘里恢复。
+- **写入类操作会弹审批**，这是 DSH 的安全机制，不是出错。
+- **一次只显示 10 项**，点「加载更多」翻页；看过的目录会被缓存，再次进入很快。
+- 如果长时间不用，登录凭据可能过期，届时重新登录即可。
+
+## 配置
+
+可选，在 profile 的 `cordis.patch.yml` 里：
+
+```yaml
+- id: dsh-mcloud
+  name: 'dsh-mcloud'
+  config:
+    credentialDir: '/custom/credential/dir'   # 凭据目录
+    enableWrites: false                        # 设为 false 则关闭写入审批闸（不建议）
+```
+
+## 文件结构
+
+```
+lib/index.js      宿主端：网盘客户端、工具、HTTP 路由、凭据存储
+lib/login.js      账号密码登录
+lib/scan-login.js 扫码登录
+lib/transfer.js   上传下载的传输层
+lib/client.js     会话页面板（登录页、文件浏览、右键菜单、传输进度）
+cordis.patch.yml  bundle patch
+locale/*.json     面板标题与描述
+```
+
+## 免责声明
 
 **使用本项目即表示你已阅读、理解并同意以下全部内容。如果你不同意，请不要安装或使用。**
 
@@ -71,155 +210,15 @@
 包括但不限于数据丢失、利润损失、业务中断、账号损失——
 无论这些损害是如何产生的、基于何种责任理论，也无论作者是否已被告知此类损害的可能性。
 
-### 7. 许可
-
-本项目以 [MIT 许可](LICENSE) 发布。你可以在许可条款范围内自由使用、修改与分发，
-但**必须保留原版权声明与许可声明**。MIT 许可同样包含上述免责条款。
-
-### 8. 关于 Issue 与支持
+### 7. 关于 Issue 与支持
 
 - 本项目**不提供任何形式的商业支持或 SLA**；
 - 因接口变更导致的问题，作者**没有义务**修复；
 - 提交 Issue 时**绝不要附带凭据（Authorization / cookie / token）或截图中的敏感信息**。
 
-
-📖 [常见问题 FAQ](FAQ.md) · 📝 [更新日志](CHANGELOG.md) · 🤝 [贡献指南](CONTRIBUTING.md)
-
-## 环境要求
-
-| 项目 | 要求 |
-| --- | --- |
-| **DeepSeek Harness** | **>= 0.2.1-rc.5，< 0.4.0** |
-| Node.js | >= 22 |
-| 系统 | Windows（凭证加密与系统对话框依赖 Windows；其他平台核心功能可用但未完整验证） |
-
-查看你的 DSH 版本：`dsh --version`
-
-## 快速开始
-
-1. **装插件**（见下方「安装」）
-2. **重启 DSH** —— 插件在 profile 启动时加载
-3. 会话页顶部标签栏点「**移动云盘**」
-4. 用**扫码**或**账号密码**登录（全新安装一定是未登录状态）
-5. 看到容量和文件列表 → 可以用了
-
-之后可以直接让 AI 操作网盘，也可以右键菜单自己动手。
-
-## 安装
-
-从 GitHub 装（推荐）：
-
-```powershell
-dsh plugin --profile desktop add github:GIYN-S/dsh-mcloud
-```
-
-或下载 Release 里的 tgz：
-
-```powershell
-dsh plugin --profile desktop add https://github.com/GIYN-S/dsh-mcloud/releases/download/v0.2.0/dsh-mcloud-0.2.0.tgz
-```
-
-本地开发用 link：
-
-```powershell
-dsh plugin --profile desktop add "link:/path/to/dsh-mcloud"
-```
-
-装完**重启 DSH** 才生效。
-
-## 登录
-
-打开面板会看到登录页，两种方式任选：
-
-### 扫码登录（推荐）
-
-点「**开始扫码登录**」→ 弹出一个浏览器窗口 → 手机扫码 → 完成。
-
-- 不需要输密码
-- 凭据会自动续期，日常**不需要反复扫码**
-- 弹出的是独立 profile 的浏览器，不影响你日常用的 Edge
-
-### 账号密码登录
-
-在「账号密码」页签填手机号/邮箱和密码。
-
-- **密码默认只用一次**，登录成功后立刻丢弃
-- 勾选「**记住密码**」才会保存，用 Windows DPAPI 加密存在本机
-
-### 退出登录
-
-面板里点「退出登录」，会清掉本机凭据，回到未登录状态。
-
-### 凭据存在哪
-
-`%USERPROFILE%\.dsh-mcloud\authorization.dpapi` —— 当前用户的 DPAPI 加密，
-换用户或换机器都解不开。想换位置在配置里写 `credentialDir`。
-
-**不要把凭据贴到 Issue、聊天记录或截图里。**
-
-## 功能
-
-### 面板内操作
-
-| 操作 | 说明 |
-| --- | --- |
-| 浏览目录 | 点击文件夹进入，顶部面包屑可回退 |
-| 容量 | 显示总量 / 已用 / 剩余 |
-| 上传 | 右键 → 上传文件 / 上传文件夹 / 拖动上传 |
-| 下载 | 右键 → 下载到本地 / 打开下载直链 / 下载整个文件夹 |
-| 转移 | 右键 → 转移到…（选择目标文件夹） |
-| 复制路径 | 右键 → 复制路径 |
-| 重命名 / 删除 | 右键菜单 |
-
-### 模型工具
-
-| 工具 | 用途 |
-| --- | --- |
-| `mcloud_quota` | 查询容量 |
-| `mcloud_list` | 列目录 |
-| `mcloud_search` | 按文件名搜索 |
-| `mcloud_upload` | 上传本地文件（按路径，直接从磁盘读） |
-| `mcloud_upload_folder` | 上传整个本地文件夹 |
-| `mcloud_download` | 下载到本地 |
-| `mcloud_download_folder` | 递归下载整个文件夹 |
-| `mcloud_download_link` | 获取下载直链 |
-| `mcloud_mkdir` | 新建文件夹 |
-| `mcloud_rename` | 重命名 |
-| `mcloud_move` | 转移 |
-| `mcloud_remove` | 删除（进回收站） |
-
-## 使用提示
-
-- **大文件或整个目录**：让模型调用 `mcloud_upload`，走本机路径直传，效率最高。
-  面板里的上传需要经过浏览器中转一次。
-- **下载整个文件夹**不是压缩包：移动云盘没有打包下载接口，插件会递归遍历后逐个下载。
-- **删除进回收站**，可以在网盘里恢复。
-- **写入类操作会弹审批**，这是 DSH 的安全机制，不是出错。
-
-## 配置
-
-可选，在 profile 的 `cordis.patch.yml` 里：
-
-```yaml
-- id: dsh-mcloud
-  name: 'dsh-mcloud'
-  config:
-    credentialDir: '/custom/credential/dir'   # 凭据目录
-    enableWrites: false                        # 设为 false 则关闭写入审批闸（不建议）
-```
-
-## 文件结构
-
-```
-lib/index.js      宿主端：网盘客户端、工具、HTTP 路由、凭据存储
-lib/login.js      账号密码登录
-lib/scan-login.js 扫码登录
-lib/transfer.js   上传下载的传输层
-lib/client.js     会话页面板（登录页、文件浏览、右键菜单、传输进度）
-cordis.patch.yml  bundle patch
-locale/*.json     面板标题与描述
-```
-
 ## 许可
 
-[MIT](LICENSE)
+本项目以 [MIT 许可](LICENSE) 发布。你可以在许可条款范围内自由使用、修改与分发，
+但**必须保留原版权声明与许可声明**。MIT 许可同样包含上述免责条款。
+
+详见 [LICENSE](LICENSE)。
