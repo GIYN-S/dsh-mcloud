@@ -47,7 +47,8 @@
     "mcp"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "dsh": ">=0.2.1-rc.5 <0.4.0-0"
   },
   "license": "MIT"
 }

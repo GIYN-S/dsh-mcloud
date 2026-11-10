@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 dsh-mobile-cloud contributors
+Copyright (c) 2026 dsh-mcloud contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -20,8 +20,32 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
----
+================================================================================
+ADDITIONAL NOTICE AND DISCLAIMER
+================================================================================
 
-NOTE: This project talks to China Mobile Cloud (139) through interfaces that
-were reverse-engineered by the community. It is not affiliated with, endorsed
-by, or supported by China Mobile. Use at your own risk.
+This project is NOT affiliated with, endorsed by, sponsored by, or authorized
+by China Mobile (中国移动) or China Mobile Cloud / 139 Cloud Drive (移动云盘).
+
+It communicates with the service through UNOFFICIAL, reverse-engineered
+interfaces that are not public APIs and carry no stability guarantee. Those
+interfaces may change or be withdrawn at any time, with or without notice, and
+the project may stop working as a result. Use of such interfaces may conflict
+with the service's terms of use.
+
+"China Mobile", "139", "移动云盘" and related marks belong to their respective
+owners and are used here only descriptively, to identify the service this tool
+connects to. No trademark rights are claimed.
+
+THE SOFTWARE CAN MODIFY YOUR CLOUD DRIVE CONTENTS (upload, move, rename,
+delete). Deletions go to the recycle bin and are usually recoverable, but this
+is not guaranteed. Do not use this software on data you cannot afford to lose.
+
+Credential storage relies on Windows DPAPI (current-user scope). It protects
+against other users and other machines, but NOT against malware, physical
+access, or a compromised account environment on the same machine.
+
+BY INSTALLING OR USING THIS SOFTWARE YOU ACCEPT FULL RESPONSIBILITY for any
+account restriction, service interruption, data loss, or terms-of-service
+violation that may result. The authors provide no support obligation, no
+service level, and no guarantee of fitness for any particular purpose.
