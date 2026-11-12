@@ -5,13 +5,16 @@
 
 📖 [常见问题 FAQ](FAQ.md) · 📝 [更新日志](CHANGELOG.md) · 🤝 [贡献指南](CONTRIBUTING.md)
 
+[![npm](https://img.shields.io/npm/v/dsh-mcloud?color=cb3837&logo=npm&logoColor=white)](https://www.npmjs.com/package/dsh-mcloud)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 ## 快速开始
 
 **环境要求**
 
 | 项目 | 要求 |
 | --- | --- |
-| DeepSeek Harness | **>= 0.2.1-rc.5**（`dsh --version` 查看） |
+| DeepSeek Harness | **>= 0.2.1-rc.5，< 0.4.0**（`dsh --version` 查看） |
 | Node.js | >= 22 |
 | 系统 | Windows |
 
@@ -27,7 +30,19 @@
 
 ## 安装
 
-从 GitHub 装（推荐）：
+最省事：在 DSH 的「添加插件」里输入包名：
+
+```
+dsh-mcloud
+```
+
+或者用命令行：
+
+```powershell
+dsh plugin --profile desktop add dsh-mcloud
+```
+
+也可以从 GitHub 装：
 
 ```powershell
 dsh plugin --profile desktop add github:GIYN-S/dsh-mcloud
