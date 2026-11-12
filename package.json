@@ -1,6 +1,6 @@
 {
   "name": "dsh-mcloud",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "中国移动云盘（139）接入 DeepSeek Harness：容量查询、列目录、上传下载、转移、以及在会话页提供一个可操作的标签面板。",
   "type": "module",
   "main": "lib/index.js",
@@ -46,7 +46,7 @@
   ],
   "engines": {
     "node": ">=22",
-    "dsh": ">=0.2.1-rc.5 <0.4.0-0"
+    "dsh": ">=0.2.1-rc.5 <0.3.0-0"
   },
   "repository": {
     "type": "git",
