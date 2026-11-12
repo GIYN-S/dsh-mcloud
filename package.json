@@ -1,7 +1,6 @@
 {
   "name": "dsh-mcloud",
   "version": "0.2.0",
-  "private": true,
   "description": "中国移动云盘（139）接入 DeepSeek Harness：容量查询、列目录、上传下载、转移、以及在会话页提供一个可操作的标签面板。",
   "type": "module",
   "main": "lib/index.js",
@@ -43,12 +42,23 @@
     "139",
     "mobile-cloud",
     "china-mobile",
-    "yun139",
-    "mcp"
+    "yun139"
   ],
   "engines": {
     "node": ">=22",
     "dsh": ">=0.2.1-rc.5 <0.4.0-0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GIYN-S/dsh-mcloud.git"
+  },
+  "homepage": "https://github.com/GIYN-S/dsh-mcloud#readme",
+  "bugs": {
+    "url": "https://github.com/GIYN-S/dsh-mcloud/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "license": "MIT"
 }
