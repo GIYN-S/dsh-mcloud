@@ -14,7 +14,7 @@
 
 | 项目 | 要求 |
 | --- | --- |
-| DeepSeek Harness | **>= 0.2.1-rc.5，< 0.4.0**（`dsh --version` 查看） |
+| DeepSeek Harness | **>= 0.2.1-rc.5，< 0.3.0** |
 | Node.js | >= 22 |
 | 系统 | Windows |
 
