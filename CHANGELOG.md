@@ -17,6 +17,30 @@
 
 ---
 
+## 0.3.1
+
+**安全修复：`/api/dsh-mcloud/*` 现在有 Host / Origin 准入。**
+
+DSH 的 `webServer.register` 只按路径分发，**不做**准入。插件原来只查了「连接是不是来自
+环回地址」，而你自己浏览器里开着的任意网页发出的请求，`remoteAddress` 一样是 `127.0.0.1`。
+于是任意网页都能读 `/list`、`/search`、`/status`，也能打 `/mkdir`、`/remove`、`/move`、
+`/upload` 等写接口。原有的 `x-dsh-mcloud: 1` **不是安全边界**，静态请求头任何网页都能自己加。
+
+现在所有路由统一过一道闸（`lib/request-guard.js`）：
+
+- **Host** 必须是本部署自己的 authority（环回 / 监听器绑定 IP / `allowedAuthorities`），
+  端口要对得上监听器；解析不出、带 userinfo、带路径的一律拒
+- **Origin** 必须与 Host 同源；`null`（沙箱 iframe、`file:` 页面）直接拒
+- **`Sec-Fetch-Site: cross-site`** 一票否决
+
+新增 24 项回归测试（`npm test`）。其中 4 条攻击路径用例在 0.3.0 上全部失败，本版全部通过。
+
+**新增配置**：`allowedAuthorities`，只有挂了反代或用自定义域名访问时才需要。
+
+0.3.0 的功能与界面不变。
+
+---
+
 ## 0.3.0
 
 **界面重做为资源管理器风格**（登录页保持不变）。

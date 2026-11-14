@@ -154,18 +154,39 @@ dsh plugin --profile desktop add "link:/path/to/dsh-mcloud"
   config:
     credentialDir: '/custom/credential/dir'   # 凭据目录
     enableWrites: false                        # 设为 false 则关闭写入审批闸（不建议）
+    # 仅当你在 DSH 前面挂了反代 / 用自定义域名访问时才需要：
+    allowedAuthorities: ['dsh.example.com']
 ```
+
+## 安全说明
+
+`/api/dsh-mcloud/*` 是一组挂在本机 webServer 上的接口，能读写你已登录的云盘。
+DSH 的 `webServer.register` 只按路径分发、**不做** Host / Origin 准入，所以插件自己
+带了一道闸（`lib/request-guard.js`），每条路由都会过：
+
+- **Host** 必须是本部署自己的 authority（环回 / 监听器绑定 IP / `allowedAuthorities`），
+  且端口要对得上监听器；
+- **Origin** 必须与 Host 同源，`null` 直接拒；
+- **`Sec-Fetch-Site: cross-site`** 一票否决。
+
+这挡住的是 DNS rebinding 和「你用浏览器打开恶意网页、它替你打本机接口」这两类攻击。
+注意 `x-dsh-mcloud: 1` 这个请求头**只是标记，不是安全边界** —— 任何网页都能自己加，
+真正起作用的是上面三条。
+
+`npm test` 跑安全回归（24 项，含 4 条攻击路径）。
 
 ## 文件结构
 
 ```
-lib/index.js      宿主端：网盘客户端、工具、HTTP 路由、凭据存储
-lib/login.js      账号密码登录
-lib/scan-login.js 扫码登录
-lib/transfer.js   上传下载的传输层
-lib/client.js     会话页面板（登录页、文件浏览、右键菜单、传输进度）
-cordis.patch.yml  bundle patch
-locale/*.json     面板标题与描述
+lib/index.js         宿主端：网盘客户端、工具、HTTP 路由、凭据存储
+lib/request-guard.js 请求闸：Host / Origin / DNS rebinding 防护
+lib/login.js         账号密码登录
+lib/scan-login.js    扫码登录
+lib/transfer.js      上传下载的传输层
+lib/client.js        会话页面板（登录页、文件浏览、右键菜单、传输进度）
+cordis.patch.yml     bundle patch
+locale/*.json        面板标题与描述
+test/                安全回归测试（node --test）
 ```
 
 ## 免责声明
