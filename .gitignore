@@ -30,3 +30,6 @@ _*.ps1
 
 # 本机发布脚本（含个人路径提示）
 publish.ps1
+
+# npm pack 产物
+*.tgz
