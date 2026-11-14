@@ -51,7 +51,7 @@ dsh plugin --profile desktop add github:GIYN-S/dsh-mcloud
 或下载 Release 里的 tgz：
 
 ```powershell
-dsh plugin --profile desktop add https://github.com/GIYN-S/dsh-mcloud/releases/download/v0.3.2/dsh-mcloud-0.3.2.tgz
+dsh plugin --profile desktop add https://github.com/GIYN-S/dsh-mcloud/releases/download/v0.3.3/dsh-mcloud-0.3.3.tgz
 ```
 
 本地开发用 link：

@@ -17,6 +17,15 @@
 
 ---
 
+## 0.3.3
+
+修复 0.3.1 / 0.3.2 装不上的问题：这两个版本的 `package.json` 带了 UTF-8 BOM，
+DSH 校验时会报 `SyntaxError: Unexpected token ''`，导致安装被拒。现已去掉。
+代码与 0.3.2 相同。
+
+> 如果你的环境装了 pnpm 且开了 `minimumReleaseAge`（默认开启），刚发布的版本
+> 可能暂时不可见。用 `dsh plugin add dsh-mcloud@0.3.3` 指定版本，或等一会儿再装。
+
 ## 0.3.2
 
 修正 README 里指向旧版 tgz 的安装链接（原先仍指向 0.2.0）。代码与 0.3.1 相同。
