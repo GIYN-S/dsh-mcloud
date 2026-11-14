@@ -17,6 +17,16 @@
 
 ---
 
+## 0.3.4
+
+`/status` 不再返回凭据文件的完整路径。原先回的是 `credentialPath`（形如
+`C:\Users\<用户名>\.dsh-mcloud\authorization.dpapi`），会把本机 Windows 用户名
+暴露给任何能读到该接口的地方；现在只回文件名 `credentialFileName`
+（`authorization.dpapi`），面板展示不受影响。
+
+顺带把市场条目里过时的安全描述更新了——0.3.1 起 Host / Origin 准入已经补上，
+原先那句「没有准入检查」的描述不再准确。
+
 ## 0.3.3
 
 修复 0.3.1 / 0.3.2 装不上的问题：这两个版本的 `package.json` 带了 UTF-8 BOM，
