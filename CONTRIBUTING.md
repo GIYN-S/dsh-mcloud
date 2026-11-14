@@ -8,7 +8,7 @@
 - Node.js **>= 22**（插件用了内置 `fetch`、`AbortSignal.timeout`、`node:stream/promises`）
 - Windows（宿主端用 Puppeteer 无依赖的 PowerShell + WinForms 处理系统对话框与 DPAPI；
   macOS / Linux 上凭据改用文件权限，但部分功能未验证）
-- DeepSeek Harness `0.2.x`
+- DeepSeek Harness `>= 0.2.1-rc.5, < 0.3.0`（插件 0.3.x 的兼容范围）
 
 ## 本地开发
 
