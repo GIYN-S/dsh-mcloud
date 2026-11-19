@@ -12,6 +12,13 @@ access.token
 .env
 .env.*
 
+# 传输记录（⚠️ 0.4.0 起会落盘，里面带本机绝对路径 + Windows 用户名）
+# 形如 {"transfers":[{"localPath":"C:\\Users\\<名字>\\Downloads\\..."}]}
+# 它和凭据放在同一个目录，但文件名不在上面的白名单里 —— 曾经漏过。
+transfers.json
+transfers.json.tmp-*
+*.transfers.json
+
 # 日志与临时文件
 *.log
 npm-debug.log*
