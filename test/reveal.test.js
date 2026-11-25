@@ -54,6 +54,57 @@ describe('cleanParentPath：上传目标目录的展示路径', () => {
   })
 })
 
+describe('0.4.4 第 3 条：explorer 定位的参数必须能处理带空格的路径', () => {
+  /**
+   * 真机踩的坑（用户的「下载定位无效」就是这个）：
+   *
+   * 老写法 `spawn('explorer.exe', ['/select,' + path])` 走 Node 默认的 quoting。
+   * Node 会把**含空格的参数**整串再包一层引号，于是命令行变成
+   * `"/select,C:\a b\x.txt"` —— explorer 看到的是一个带引号的斜杠命令，
+   * 认不出来，退化成打开「文档」。
+   *
+   * 实测（真实 explorer.exe，用窗口标题判断落在哪个目录）：
+   *   ['/select,' + p]（默认 quoting）                        → ❌ 打开「文档」
+   *   ['/select,', p]（两个参数，默认 quoting）                → ✅
+   *   ['/select,' + p] + windowsVerbatimArguments             → ✅
+   *   ['/select,"' + p + '"'] + windowsVerbatimArguments      → ✅（现在用这个）
+   *
+   * 所以这里断言的是两件事：
+   *   1. 必须用 windowsVerbatimArguments（由我们自己决定命令行长什么样）；
+   *   2. 路径本身必须被双引号包住，且斜杠命令**紧贴**在前（/select,）。
+   */
+  test('文件：/select,"<路径>" + verbatim（不能靠 Node 自作主张加引号）', () => {
+    const path = 'C:\\Users\\somebody\\Downloads\\dsh-mcloud\\a b.zip'
+    const { args, options } = __test.explorerLocateArgs(path, false)
+
+    assert.deepEqual(args, [`/select,"${path}"`], '参数形状不对：' + JSON.stringify(args))
+    assert.equal(
+      options.windowsVerbatimArguments,
+      true,
+      '没有 windowsVerbatimArguments —— Node 会给含空格的参数再加一层引号，explorer 就认不出来了',
+    )
+
+    // 命令和路径之间不能有空格（/select, 要贴着引号）
+    assert.ok(args[0].startsWith('/select,"'), '斜杠命令和路径之间被插了空格：' + args[0])
+  })
+
+  test('目录：直接给带引号的路径，不做 /select', () => {
+    const path = 'C:\\Users\\somebody\\Downloads\\dsh-mcloud\\照片 2024'
+    const { args, options } = __test.explorerLocateArgs(path, true)
+    assert.deepEqual(args, [`"${path}"`], '目录参数形状不对：' + JSON.stringify(args))
+    assert.equal(options.windowsVerbatimArguments, true)
+    assert.ok(!args[0].includes('/select'), '打开目录不该带 /select')
+  })
+
+  test('中文 / 逗号 / & 都只是普通字符（不再被二次转义）', () => {
+    const funny = 'C:\\tmp\\a,b & 中文 目录\\x y.txt'
+    const { args } = __test.explorerLocateArgs(funny, false)
+    assert.equal(args[0], `/select,"${funny}"`)
+    // 不能出现两个连续的引号（那是「自己加了一次、Node 又加一次」的症状）
+    assert.ok(!args[0].includes('""'), '出现了重复引号：' + args[0])
+  })
+})
+
 function mountPlugin() {
   return new Promise((resolve) => {
     const routes = []

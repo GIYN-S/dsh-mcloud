@@ -24,7 +24,7 @@ import { join } from 'node:path'
 const credentialDir = mkdtempSync(join(tmpdir(), 'mcloud-transfers-test-'))
 process.env.DSH_MCLOUD_CREDENTIAL_DIR = credentialDir
 
-const { apply } = await import('../lib/index.js')
+const { apply, __test } = await import('../lib/index.js')
 
 const TRANSFERS_FILE = join(credentialDir, 'transfers.json')
 
@@ -170,8 +170,7 @@ describe('0.4.0：传输记录持久化', () => {
     }
   })
 
-  test('上次退出时还在 running 的任务，重启后标成「中断」而不是一直转圈', async () => {
-    writeFileSync(TRANSFERS_FILE, JSON.stringify({
+  test('上次退出时还在 running 的任务，重启后标成「中断」而不是一直转圈', async () => {    writeFileSync(TRANSFERS_FILE, JSON.stringify({
       version: 1,
       savedAt: Date.now(),
       transfers: [{
@@ -346,17 +345,300 @@ describe('0.4.0：定位复核（文件被移动了就显示无法定位）', ()
     assert.match(res.text, /无法定位/, '没有说明「无法定位」：' + res.text)
     assert.match(res.text, /移动|删除/, '没有说明原因是「被移动或删除」：' + res.text)
   })
+
+  /**
+   * 🔴 0.4.4 第 3 条的主因回归：**文件还在**时，/reveal 必须真的拿到路径。
+   *
+   * 老代码是 `const found = client.getJob(id); target = found.localPath` ——
+   * 而 getJob 返回的 snapshot() 为了不泄露本机路径，**故意不含 localPath**。
+   * 于是 target 永远是空串，每一次定位都抛「这条记录没有记下本机位置」，
+   * 表现就是「下载定位无效」。
+   *
+   * 这条用例把「文件真的存在」这条路径走一遍：只要还能读到这个毛病，它就红。
+   */
+  test('文件还在时：/reveal 能取到落点并交给 explorer（不再说「没有记下本机位置」）', async () => {
+    const realDir = mkdtempSync(join(tmpdir(), 'mcloud-reveal-live-'))
+    // 路径里**故意带空格**：这也覆盖了 explorer 参数引号那一层
+    const realFile = join(realDir, 'a b.zip')
+    writeFileSync(realFile, 'x', 'utf8')
+
+    // 造一条「本机文件还在」的记录
+    writeFileSync(TRANSFERS_FILE, JSON.stringify({
+      version: 1,
+      savedAt: Date.now(),
+      transfers: [{
+        id: 'live-dl', kind: 'download', label: 'a b.zip', phase: 'complete',
+        done: 1, total: 1, state: 'done', error: null,
+        startedAt: Date.now() - 3000, finishedAt: Date.now() - 1000,
+        localPath: realFile, parentFileId: null, parentPath: null,
+      }],
+    }), 'utf8')
+
+    const live = await mountPlugin()
+    try {
+      const res = await post(live.port, '/api/dsh-mcloud/reveal', { jobId: 'live-dl' })
+
+      // 关键断言 1：不能报「没有记下本机位置」
+      assert.doesNotMatch(
+        res.text,
+        /没有记下本机位置/,
+        '/reveal 取不到 localPath —— getJob 返回的是不含路径的 snapshot（老 bug 又回来了）：' + res.text,
+      )
+      // 关键断言 2：走通了（explorer 被拉起来了）。非 Windows 上会明确报不支持，也算「越过了取路径这一步」。
+      if (process.platform === 'win32') {
+        assert.equal(res.status, 200, '/reveal 没成功：' + res.text)
+        const doc = JSON.parse(res.text)
+        assert.equal(doc.ok, true)
+        assert.equal(doc.isDirectory, false)
+      } else {
+        assert.match(res.text, /只支持 Windows/, '非 Windows 应该明确说不支持：' + res.text)
+      }
+
+      // 关键断言 3：路径依然不能通过任何读接口泄露出去
+      // （label 里当然有文件名 —— 那是给用户看的；不能出现的是**完整路径**）
+      const list = await get(live.port, '/api/dsh-mcloud/transfers')
+      assert.doesNotMatch(list.text, /localPath/, '/transfers 里出现了 localPath 字段')
+      assert.doesNotMatch(
+        list.text,
+        /mcloud-reveal-live|[A-Za-z]:\\\\Users|[A-Za-z]:\\\\/,
+        '/transfers 泄露了本机绝对路径：' + list.text.slice(0, 300),
+      )
+    } finally {
+      live.server.close()
+      rmSync(realDir, { recursive: true, force: true })
+    }
+  })
 })
 
 // ================================================================
-// 4. 记录文件夹入口（替代「清空记录」）
+// 0.4.7：删除传输**记录**（不是文件）
+// ----------------------------------------------------------------
+// 用户原话：「注意删除的不是文件，而是记录」。
+// 所以这里断言两件事：
+//   1. 删完之后 /transfers 里真少了那一条；
+//   2. 删除动作**完全不碰**文件 —— 本机那个文件还在，也没有任何文件操作请求。
 // ================================================================
-describe('0.4.0：没有「清空记录」了，改成能打开记录文件夹', () => {
-  test('/transfers/clear 已经不存在', async () => {
+describe('0.4.7：删除传输记录，不动文件', () => {
+  function seed(rows) {
+    writeFileSync(TRANSFERS_FILE, JSON.stringify({
+      version: 1,
+      savedAt: Date.now(),
+      transfers: rows,
+    }), 'utf8')
+  }
+
+  test('删单条：记录消失，本机文件还在', async () => {
+    const realDir = mkdtempSync(join(tmpdir(), 'mcloud-keep-file-'))
+    const realFile = join(realDir, 'keep-me.zip')
+    writeFileSync(realFile, 'important', 'utf8')
+
+    seed([
+      {
+        id: 'dl-keep', kind: 'download', label: 'keep-me.zip', phase: 'complete',
+        done: 1, total: 1, state: 'done', error: null,
+        startedAt: Date.now() - 5000, finishedAt: Date.now() - 1000,
+        localPath: realFile, parentFileId: null, parentPath: null,
+      },
+      {
+        id: 'dl-other', kind: 'download', label: 'other.zip', phase: 'complete',
+        done: 1, total: 1, state: 'done', error: null,
+        startedAt: Date.now() - 4000, finishedAt: Date.now() - 900,
+        localPath: null, parentFileId: null, parentPath: null,
+      },
+    ])
+
+    const ctx = await mountPlugin()
+    try {
+      const res = await post(ctx.port, '/api/dsh-mcloud/transfers/remove', { jobId: 'dl-keep' })
+      assert.equal(res.status, 200, res.text)
+      assert.equal(JSON.parse(res.text).removed, 1)
+
+      // 记录真的少了
+      const list = JSON.parse((await get(ctx.port, '/api/dsh-mcloud/transfers')).text)
+      const ids = (list.jobs || []).map((j) => j.id)
+      assert.ok(!ids.includes('dl-keep'), '记录没删掉：' + JSON.stringify(ids))
+      assert.ok(ids.includes('dl-other'), '把别的记录也删了：' + JSON.stringify(ids))
+
+      // 🔴 本机文件必须还在
+      assert.equal(existsSync(realFile), true, '文件被删掉了！用户要的是只删记录')
+      assert.equal(readFileSync(realFile, 'utf8'), 'important', '文件内容被改动了')
+    } finally {
+      ctx.server.close()
+      rmSync(realDir, { recursive: true, force: true })
+    }
+  })
+
+  test('一键删除：只清该 family，另一页的记录保留', async () => {
+    seed([
+      {
+        id: 'u1', kind: 'upload', label: 'a.txt', phase: 'complete',
+        done: 1, total: 1, state: 'done', error: null,
+        startedAt: Date.now() - 5000, finishedAt: Date.now() - 1000,
+        localPath: null, parentFileId: 'P', parentPath: null,
+      },
+      {
+        id: 'u2', kind: 'upload', label: 'b.txt', phase: 'complete',
+        done: 1, total: 1, state: 'done', error: null,
+        startedAt: Date.now() - 4000, finishedAt: Date.now() - 900,
+        localPath: null, parentFileId: 'P', parentPath: null,
+      },
+      {
+        id: 'd1', kind: 'download', label: 'c.zip', phase: 'complete',
+        done: 1, total: 1, state: 'done', error: null,
+        startedAt: Date.now() - 3000, finishedAt: Date.now() - 800,
+        localPath: null, parentFileId: null, parentPath: null,
+      },
+    ])
+
+    const ctx = await mountPlugin()
+    try {
+      const res = await post(ctx.port, '/api/dsh-mcloud/transfers/clear', { family: 'upload' })
+      assert.equal(res.status, 200, res.text)
+      assert.equal(JSON.parse(res.text).removed, 2, '一键删除的数量不对：' + res.text)
+
+      const list = JSON.parse((await get(ctx.port, '/api/dsh-mcloud/transfers')).text)
+      const ids = (list.jobs || []).map((j) => j.id).sort()
+      assert.deepEqual(ids, ['d1'], '只该删掉上传记录，下载记录要保留：' + JSON.stringify(ids))
+    } finally {
+      ctx.server.close()
+    }
+  })
+
+  test('删不存在的记录 → 400，不静默成功', async () => {
+    seed([])
+    const ctx = await mountPlugin()
+    try {
+      const res = await post(ctx.port, '/api/dsh-mcloud/transfers/remove', { jobId: 'nope' })
+      assert.equal(res.status, 400, res.text)
+      assert.match(res.text, /找不到这条传输记录/)
+    } finally {
+      ctx.server.close()
+    }
+  })
+
+  test('删除路由要过写接口的闸（跨站请求不能删记录）', async () => {
+    seed([{
+      id: 'x1', kind: 'download', label: 'x.zip', phase: 'complete',
+      done: 1, total: 1, state: 'done', error: null,
+      startedAt: Date.now() - 1000, finishedAt: Date.now(),
+      localPath: null, parentFileId: null, parentPath: null,
+    }])
+    const ctx = await mountPlugin()
+    try {
+      const body = JSON.stringify({ jobId: 'x1' })
+      const res = await send(ctx.port, {
+        method: 'POST',
+        path: '/api/dsh-mcloud/transfers/remove',
+        headers: {
+          host: `127.0.0.1:${ctx.port}`,
+          origin: 'http://evil.example',
+          'content-type': 'application/json',
+          'x-dsh-mcloud': '1',
+          'content-length': Buffer.byteLength(body),
+        },
+        body,
+      })
+      assert.equal(res.status, 403, '跨站请求居然能删记录：' + res.text)
+
+      // 记录还在
+      const list = JSON.parse((await get(ctx.port, '/api/dsh-mcloud/transfers')).text)
+      assert.ok((list.jobs || []).some((j) => j.id === 'x1'), '被跨站请求删掉了')
+    } finally {
+      ctx.server.close()
+    }
+  })
+})
+
+// ================================================================
+// 5. 0.4.5 第 1 条：上传记录必须能反查出**完整路径**
+// ----------------------------------------------------------------
+// 用户原话：「传输记录上传中无法定位上传的图片」
+//
+// 根因不在界面，而在宿主：上传记录里 `parentPath` 经常是 null（老记录 / 拖拽上传），
+// 只有 `parentFileId`。界面拿不到层级名就只能退回根目录 ——
+// 照片在 /Windows/实验/…/第一周实验结果 里，点定位却跳回 /，当然「找不到」。
+//
+// 修复是宿主用 BFS 反查祖先链（网盘没有「按 id 反查路径」的接口）。
+// 这段逻辑不依赖凭据，所以直接拿一个假网盘结构测它本身。
+// ================================================================
+describe('0.4.5 第 1 条：按 fileId 反查完整路径（BFS）', () => {
+  /** 造一个「能按目录列子项」的假 listFiles。 */
+  function fakeListing(trees) {
+    return async function listFiles(parentId) {
+      const key = String(parentId || '/')
+      return {
+        items: (trees[key] || []).map((it) => ({
+          id: it.id,
+          name: it.name,
+          size: 0,
+          type: it.type,
+          updatedAt: '',
+        })),
+        nextCursor: null,
+      }
+    }
+  }
+
+  test('能一路找到深处目录，并且 trail 带每级的真实 id（含目标自己）', async () => {
+    const { resolveRemotePathBfs } = __test
+    assert.equal(typeof resolveRemotePathBfs, 'function', '没有导出 resolveRemotePathBfs')
+
+    const trees = {
+      '/': [{ id: 'W', name: 'Windows', type: 'folder' }],
+      W: [{ id: 'EXP', name: '实验', type: 'folder' }],
+      EXP: [{ id: 'DIMG', name: '数字图像实验', type: 'folder' }],
+      DIMG: [{ id: 'DEEP', name: '第一周实验结果', type: 'folder' }],
+      DEEP: [{ id: 'IMG1', name: '照片.jpg', type: 'file' }],
+    }
+
+    // 传入的 parentFileId 就是「照片所在的那个目录」
+    const result = await resolveRemotePathBfs('DEEP', { listFiles: fakeListing(trees) })
+    assert.ok(result, '没有反查出路径（BFS 走空了）')
+    assert.equal(result.path, '/Windows/实验/数字图像实验/第一周实验结果')
+    assert.deepEqual(
+      result.trail.map((e) => e.id),
+      ['W', 'EXP', 'DIMG', 'DEEP'],
+      'trail 里缺了真实 id（界面要靠它重建面包屑）：' + JSON.stringify(result.trail),
+    )
+    assert.deepEqual(
+      result.trail.map((e) => e.name),
+      ['Windows', '实验', '数字图像实验', '第一周实验结果'],
+    )
+  })
+
+  test('根目录自己就直接返回 null（根不需要反查）', async () => {
+    const { resolveRemotePathBfs } = __test
+    const result = await resolveRemotePathBfs('/', { listFiles: fakeListing({}) })
+    assert.equal(result, null)
+  })
+
+  test('找不到时返回 null，而不是抛错（调用方退回记录里的 parentPath）', async () => {
+    const { resolveRemotePathBfs } = __test
+    const trees = { '/': [{ id: 'A', name: '别的目录', type: 'folder' }] }
+    const result = await resolveRemotePathBfs('NOT-THERE', { listFiles: fakeListing(trees) })
+    assert.equal(result, null)
+  })
+})
+
+// ================================================================
+// 4. 记录文件夹入口 + 删除记录
+// ================================================================
+describe('0.4.x：记录可以删了（0.4.7 起），但只删记录', () => {
+  /**
+   * 0.4.0 时这里断言的是「/transfers/clear 不存在」——因为当时的设计是
+   * 「记录永不删除」。0.4.7 用户明确要求加一键删除，所以这条约定被推翻了：
+   * 路由重新存在，但语义被钉死成「**只删记录，不动文件**」
+   * （文件那一条由「0.4.7：删除传输记录，不动文件」那组测试守着）。
+   */
+  test('/transfers/clear 重新存在，但只清记录', async () => {
     const ctx = await mountPlugin()
     try {
       const res = await post(ctx.port, '/api/dsh-mcloud/transfers/clear', {})
-      assert.equal(res.status, 404, '「清空记录」路由还在，记录就不算「永不删除」：' + res.text)
+      assert.equal(res.status, 200, '一键删除路由应该可用：' + res.text)
+      const doc = JSON.parse(res.text)
+      assert.equal(doc.ok, true)
+      assert.equal(typeof doc.removed, 'number', '应该回报删了多少条')
+      assert.equal(doc.skipped, 0, '空记录表不该跳过任何东西')
     } finally {
       ctx.server.close()
     }

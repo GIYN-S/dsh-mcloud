@@ -134,7 +134,14 @@ function createHarness({ source = SRC } = {}) {
     document: doc,
     open() { return null },
     confirm() { return true },
-    prompt() { return null },
+    /**
+     * 🔴 0.4.4 第 7 条：**故意不提供 window.prompt**。
+     *
+     * Electron 没有实现 window.prompt —— 老代码 `window.prompt(...)` 永远拿不到
+     * 用户输入（返回 null 或直接抛），于是「重命名」静默失效。
+     * 这里把 prompt 设为 undefined，就是为了让「又用回 prompt」的退化立刻被测试抓到。
+     */
+    prompt: undefined,
   }
 
   const loader = {
@@ -325,6 +332,18 @@ function createHarness({ source = SRC } = {}) {
       })
     }
     if (path.startsWith('/api/dsh-mcloud/login/saved')) return json({ ok: true, hasSaved: false })
+    /**
+     * 拖文件夹上传会按相对路径逐层建远端目录（POST /mkdir-path）。
+     * 假后端要回一个稳定的 fileId，并把「建了哪些层」记下来给断言用。
+     */
+    if (path.startsWith('/api/dsh-mcloud/mkdir-path')) {
+      const rel = String((body && body.path) || '')
+      const base = String((body && body.parentFileId) || '/')
+      return json({ ok: true, fileId: 'DIR:' + base + '/' + rel })
+    }
+    if (path.startsWith('/api/dsh-mcloud/mkdir')) {
+      return json({ ok: true })
+    }
     if (path.startsWith('/api/dsh-mcloud/reveal')) return json({ ok: true, path: 'D:\\x' })
     /**
      * 上传（POST /upload 这条 fetch 路）：回 jobId，并**立刻**把那条任务登记成 done。
@@ -405,10 +424,32 @@ function createHarness({ source = SRC } = {}) {
     return host
   }
 
+  /**
+   * 跑积压的 effect。
+   *
+   * 0.4.4 起还要**留下 cleanup**：第 8 条（宽度手柄）和第 2 条（提示位置）
+   * 都要验证「卸载时还原」，没有 cleanup 就测不到。
+   */
+  const cleanups = []
   async function settle(rounds = 12) {
     for (let r = 0; r < rounds; r += 1) {
       await new Promise((resolve) => setTimeout(resolve, 0))
-      for (const { fn } of state.pendingEffects.splice(0)) fn()
+      for (const { fn } of state.pendingEffects.splice(0)) {
+        const cleanup = fn()
+        if (typeof cleanup === 'function') cleanups.push(cleanup)
+      }
+    }
+  }
+
+  /** 模拟「切走这个页签」：把所有 effect 的 cleanup 跑一遍。 */
+  function unmountView() {
+    while (cleanups.length) {
+      const cleanup = cleanups.pop()
+      try {
+        cleanup()
+      } catch {
+        /* 清理失败不该让测试挂掉 */
+      }
     }
   }
 
@@ -424,7 +465,20 @@ function createHarness({ source = SRC } = {}) {
     return renderTree()
   }
 
-  return { mod, backend, calls, slots, renderTree, settle, byClass, mount, xhrLog }
+  return {
+    mod,
+    backend,
+    calls,
+    slots,
+    renderTree,
+    settle,
+    byClass,
+    mount,
+    xhrLog,
+    unmountView,
+    docHandles: [],
+    doc,
+  }
 }
 
 // ================================================================
@@ -546,7 +600,15 @@ describe('需求 2：拖到右侧文件区直接上传', () => {
     assert.equal(h.byClass(host, 'mc-exDropLayer').length, 0, '松手后蒙层还挂着')
   })
 
-  test('拖文件夹：给出提示且不发请求', async () => {
+  /**
+   * 0.4.4 第 1 条改了这里的行为：**拖文件夹现在是能上传的**（以前是礼貌拒绝）。
+   *
+   * 这条用例原来断言「拖文件夹不发请求 + 提示改用『上传文件夹』」，
+   * 那个约定已经被用户明确要求推翻了。现在改成两条：
+   *   · 空目录（读不出文件）→ 不发请求，但要给出「没有可上传的文件」的说明；
+   *   · 有内容的目录 → 真的按层级上传（见下一条用例）。
+   */
+  test('拖空文件夹：不发请求，但要说明「没有可上传的文件」', async () => {
     const h = createHarness()
     const host = await h.mount()
     const main = h.byClass(host, 'mc-exMain')[0]
@@ -554,15 +616,91 @@ describe('需求 2：拖到右侧文件区直接上传', () => {
     main.props.onDrop({
       preventDefault() {}, stopPropagation() {},
       dataTransfer: {
-        items: [{ kind: 'file', webkitGetAsEntry: () => ({ isDirectory: true }), getAsFile: () => null }],
+        items: [{
+          kind: 'file',
+          webkitGetAsEntry: () => ({
+            isDirectory: true,
+            name: '空目录',
+            createReader: () => ({ readEntries: (cb) => cb([]) }),
+          }),
+          getAsFile: () => null,
+        }],
         files: [],
       },
     })
-    await h.settle(6)
-    assert.equal(h.xhrLog.length, 0, '拖文件夹不该发起上传')
+    await h.settle(8)
+    assert.equal(h.xhrLog.length, 0, '空文件夹不该发起上传')
     const host2 = h.renderTree()
     const banners = h.byClass(host2, 'mc-exBanner').map((n) => JSON.stringify(n)).join(' ')
-    assert.match(banners, /上传文件夹/, '拖文件夹没有提示改用「上传文件夹」')
+    assert.match(banners, /没有可上传的文件/, '空文件夹没有给出说明：' + banners.slice(0, 200))
+  })
+
+  test('拖有内容的文件夹：递归展开，按原来的层级建目录并上传', async () => {
+    const h = createHarness()
+    const host = await h.mount()
+    const main = h.byClass(host, 'mc-exMain')[0]
+
+    // 造一棵：照片/2024/a.jpg + 照片/b.png
+    function fileEntry(name) {
+      return {
+        isFile: true,
+        isDirectory: false,
+        name,
+        file(cb) { cb({ name, size: 10, type: 'image/jpeg' }) },
+      }
+    }
+    function dirEntry(name, kids) {
+      return {
+        isDirectory: true,
+        isFile: false,
+        name,
+        createReader() {
+          let served = false
+          return {
+            readEntries(cb) {
+              if (served) return cb([])
+              served = true
+              cb(kids)
+            },
+          }
+        },
+      }
+    }
+
+    h.xhrLog.length = 0
+    h.calls.length = 0
+    main.props.onDrop({
+      preventDefault() {}, stopPropagation() {},
+      dataTransfer: {
+        items: [{
+          kind: 'file',
+          webkitGetAsEntry: () => dirEntry('照片', [
+            dirEntry('2024', [fileEntry('a.jpg')]),
+            fileEntry('b.png'),
+          ]),
+          getAsFile: () => null,
+        }],
+        files: [],
+      },
+    })
+    await h.settle(30)
+
+    // 两个文件都该真的传上去
+    assert.equal(h.xhrLog.length, 2, '文件夹里的文件没有被遍历上传：' + JSON.stringify(h.xhrLog.map((x) => x.url)))
+    const names = h.xhrLog.map((x) => decodeURIComponent(x.url))
+    assert.ok(names.some((u) => u.includes('a.jpg')), '漏掉了子目录里的 a.jpg')
+    assert.ok(names.some((u) => u.includes('b.png')), '漏掉了顶层的 b.png')
+
+    // 目录要按层级建出来（/mkdir-path），而且父在前、子在后
+    const mkdirs = h.calls
+      .filter((c) => c.path.startsWith('/api/dsh-mcloud/mkdir-path'))
+      .map((c) => c.body && c.body.path)
+    assert.ok(mkdirs.includes('照片'), '没有建「照片」这一层：' + JSON.stringify(mkdirs))
+    assert.ok(mkdirs.includes('照片/2024'), '没有建「照片/2024」这一层：' + JSON.stringify(mkdirs))
+    assert.ok(
+      mkdirs.indexOf('照片') < mkdirs.indexOf('照片/2024'),
+      '子目录在父目录之前建了：' + JSON.stringify(mkdirs),
+    )
   })
 })
 
@@ -1185,11 +1323,26 @@ describe('0.4.0 需求 4：定位要能识别「已经被移动」', () => {
       '已经移走了却还是切到了旧目录',
     )
     // 应该有「无法定位」提示
-    const banners = host
+    //
+    // 🔴 0.4.4 第 2 条改了它显示的位置：以前走文件区的 .mc-exBanner（被弹层整个盖住，
+    // 用户说「提示跑到名称下面去了」）；现在显示在**记录弹层内部**的
+    // .mc-exHistNotice 里。所以这里断言的是弹层里那一条。
+    const histNotice = host
+      .filter((n) => String((n.props && n.props.className) || '').includes('mc-exHistNotice'))
+      .map((n) => JSON.stringify(n))
+      .join(' ')
+    assert.match(histNotice, /无法定位/, '记录弹层里没有「无法定位」提示：' + histNotice.slice(0, 300))
+
+    // 而且不能只丢在文件区横幅里（那条被弹层盖住，用户看不到）
+    const fileBanner = host
       .filter((n) => String((n.props && n.props.className) || '').includes('mc-exBanner'))
       .map((n) => JSON.stringify(n))
       .join(' ')
-    assert.match(banners, /无法定位/, '没有提示「无法定位」：' + banners.slice(0, 300))
+    assert.doesNotMatch(
+      fileBanner,
+      /无法定位/,
+      '定位失败的提示又跑到文件区横幅（会被弹层盖住）：' + fileBanner.slice(0, 200),
+    )
   })
 
   test('下载记录：宿主说本机文件没了 → 把无法定位的理由显示出来', async () => {
@@ -1239,11 +1392,16 @@ describe('0.4.0 需求 4：定位要能识别「已经被移动」', () => {
     host = h.renderTree()
     globalThis.fetch = originalFetch
 
-    const banners = host
-      .filter((n) => String((n.props && n.props.className) || '').includes('mc-exBanner'))
+    // 0.4.4 第 2 条：理由要显示在记录弹层里（不是被弹层盖住的文件区横幅）
+    const histNotice = host
+      .filter((n) => String((n.props && n.props.className) || '').includes('mc-exHistNotice'))
       .map((n) => JSON.stringify(n))
       .join(' ')
-    assert.match(banners, /无法定位|移动|删除/, '没有把「文件已被移动」的原因提示给用户：' + banners.slice(0, 300))
+    assert.match(
+      histNotice,
+      /无法定位|移动|删除/,
+      '记录弹层里没有把「文件已被移动」的原因说清楚：' + histNotice.slice(0, 300),
+    )
   })
 })
 
@@ -1588,5 +1746,1429 @@ describe('0.4.1 需求 3：新客户端 + 旧宿主 要优雅降级', () => {
       .join(' ')
     assert.doesNotMatch(banners, /HTTP 404/, '把 HTTP 404 显示给用户了：' + banners.slice(0, 300))
     assert.match(banners, /重启/, '没有告诉用户「重启后可用」：' + banners.slice(0, 300))
+  })
+})
+
+// ================================================================
+// 0.4.4 第 3 条：下载「定位」必须真的能在资源管理器里选中文件
+// ----------------------------------------------------------------
+// 这一条的真因在**宿主**（lib/index.js 的 explorerLocateArgs）：
+// 老写法 spawn('explorer.exe', ['/select,' + path]) 走 Node 默认的 quoting，
+// 只要路径里有空格，整串会被再包一层引号，explorer 认不出斜杠命令，
+// 退化成打开「文档」—— 用户看到的就是「下载定位无效」。
+// 宿主侧的纯函数断言在 test/reveal.test.js；这里测客户端仍然只发 jobId。
+// ================================================================
+describe('0.4.4 第 3 条：下载定位只发 jobId（路径不出前端）', () => {
+  test('点定位发的是 { jobId }，请求体里没有任何本机路径', async () => {
+    const h = createHarness()
+    h.backend.jobs = [{
+      id: 'dl-path', kind: 'download', label: 'a b.zip', phase: 'download', done: 1, total: 1,
+      state: 'done', error: null, startedAt: Date.now() - 4000, finishedAt: Date.now() - 1000,
+      canRevealLocal: true, hasLocalPath: true, parentFileId: null, parentPath: null,
+    }]
+    let host = await h.mount()
+    const histBtn = host.find(
+      (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exHistoryBtn'),
+    )
+    histBtn.props.onClick()
+    await h.settle(10)
+    host = h.renderTree()
+    await h.settle(8)
+    host = h.renderTree()
+
+    const revealBtn = host.find(
+      (n) => n.type === 'button' &&
+        String((n.props && n.props.className) || '').includes('mc-exHistReveal'),
+    )
+    assert.ok(revealBtn, '下载记录没有「定位」按钮')
+
+    h.calls.length = 0
+    revealBtn.props.onClick({ stopPropagation() {} })
+    await h.settle(12)
+
+    const revealCall = h.calls.find((c) => c.path.startsWith('/api/dsh-mcloud/reveal'))
+    assert.ok(revealCall, '没有发出 /reveal')
+    assert.deepEqual(revealCall.body, { jobId: 'dl-path' }, '请求体里不该出现路径：' + JSON.stringify(revealCall.body))
+    assert.doesNotMatch(
+      JSON.stringify(revealCall.body),
+      /[A-Za-z]:\\\\|Users|Downloads/,
+      '本机绝对路径漏到前端了：' + JSON.stringify(revealCall.body),
+    )
+  })
+})
+
+// ================================================================
+// 0.4.4 第 4 条：新建文件夹按钮挪到文件夹区右侧 + 「当前路径：」
+// ================================================================
+describe('0.4.4 第 4 条：新建文件夹按钮在文件夹区右侧，原位置改成「当前路径：」', () => {
+  test('左树标题行里有「+ 新建文件夹」，工具条里没有那个按钮了', async () => {
+    const h = createHarness()
+    const host = await h.mount()
+
+    // 树头里那个 +
+    const head = h.byClass(host, 'mc-exTreeHead')[0]
+    assert.ok(head, '找不到左树标题行')
+    const addBtn = h.byClass(host, 'mc-exTreeAdd')[0]
+    assert.ok(addBtn, '文件夹区右侧没有「新建文件夹」按钮')
+    assert.equal(typeof addBtn.props.onClick, 'function', '那个按钮点不了')
+
+    // 工具条里不该再有「新建文件夹」按钮
+    const tools = h.byClass(host, 'mc-exTools')[0]
+    assert.ok(tools, '找不到工具条')
+    const toolButtonLabels = (tools.children || [])
+      .flat(Infinity)
+      .filter((c) => c && typeof c === 'object' && c.type === 'button')
+      .map((b) => (b.children || []).flat(Infinity).join(''))
+    assert.ok(
+      !toolButtonLabels.some((label) => /新建文件夹/.test(label)),
+      '工具条里还留着「新建文件夹」按钮：' + JSON.stringify(toolButtonLabels),
+    )
+  })
+
+  test('工具条里有「当前路径：」标签', async () => {
+    const h = createHarness()
+    const host = await h.mount()
+    const label = h.byClass(host, 'mc-exPathLabel')[0]
+    assert.ok(label, '工具条里没有「当前路径：」')
+    assert.match(JSON.stringify(label), /当前路径/, '标签文案不对：' + JSON.stringify(label).slice(0, 120))
+  })
+
+  test('点树头的 + 会打开新建输入框，建出来落在当前目录', async () => {
+    const h = createHarness()
+    let host = await h.mount()
+    const addBtn = h.byClass(host, 'mc-exTreeAdd')[0]
+    addBtn.props.onClick()
+    await h.settle(4)
+    host = h.renderTree()
+
+    const input = host.find(
+      (n) => n.type === 'input' && String((n.props && n.props.placeholder) || '').includes('文件夹名称'),
+    )
+    assert.ok(input, '点了 + 没有出现新建文件夹的输入框')
+
+    h.calls.length = 0
+    input.props.onChange({ target: { value: '新目录' } })
+    await h.settle(4)
+    host = h.renderTree()
+    const createBtn = host.find(
+      (n) => n.type === 'button' && (n.children || []).flat().join('').trim() === '创建',
+    )
+    assert.ok(createBtn, '找不到「创建」按钮')
+    createBtn.props.onClick()
+    await h.settle(10)
+
+    const mkdirCall = h.calls.find((c) => c.path.startsWith('/api/dsh-mcloud/mkdir'))
+    assert.ok(mkdirCall, '没有发出 /mkdir')
+    assert.equal(mkdirCall.body.name, '新目录')
+    assert.equal(mkdirCall.body.parentFileId, '/', '建错了目录')
+  })
+})
+
+// ================================================================
+// 0.4.4 第 5 条：右键多选删除 / 多选移动
+// ================================================================
+describe('0.4.4 第 5 条：多选删除 / 多选移动', () => {
+  function threeRowsHost(h, host) {
+    return host.filter(
+      (n) => String((n.props && n.props.className) || '').split(/\s+/).includes('mc-exRow'),
+    )
+  }
+
+  test('Ctrl 点击可以多选，选中集合进入多选提示条', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+      { id: 'C', name: 'c.txt', size: 3, type: 'file', updatedAt: '2026-11-03 10:00:00' },
+    ]
+    let host = await h.mount()
+    let rows = threeRowsHost(h, host)
+    assert.equal(rows.length, 3, '没渲染出三行')
+
+    rows[0].props.onClick({ ctrlKey: false, metaKey: false, shiftKey: false })
+    await h.settle(2)
+    host = h.renderTree()
+    rows = threeRowsHost(h, host)
+    rows[1].props.onClick({ ctrlKey: true })
+    await h.settle(2)
+    host = h.renderTree()
+
+    // 两行都应该是选中态
+    const selected = threeRowsHost(h, host)
+      .filter((n) => String(n.props.className).includes('mc-exRowSelected'))
+    assert.equal(selected.length, 2, 'Ctrl 点击没有加选：选中 ' + selected.length + ' 行')
+
+    // 多选提示条出现
+    const bar = h.byClass(host, 'mc-exSelectBar')[0]
+    assert.ok(bar, '选了两项却没有多选提示条')
+    assert.match(JSON.stringify(bar), /已选 2 项/, '提示条上没写选中数量')
+  })
+
+  test('Shift 点击是连选（从锚点到当前行）', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+      { id: 'C', name: 'c.txt', size: 3, type: 'file', updatedAt: '2026-11-03 10:00:00' },
+      { id: 'D', name: 'd.txt', size: 4, type: 'file', updatedAt: '2026-11-04 10:00:00' },
+    ]
+    let host = await h.mount()
+    let rows = threeRowsHost(h, host)
+    rows[0].props.onClick({})
+    await h.settle(2)
+    host = h.renderTree()
+    rows = threeRowsHost(h, host)
+    rows[2].props.onClick({ shiftKey: true })
+    await h.settle(2)
+    host = h.renderTree()
+
+    const selected = threeRowsHost(h, host)
+      .filter((n) => String(n.props.className).includes('mc-exRowSelected'))
+    assert.equal(selected.length, 3, 'Shift 连选范围不对：' + selected.length + ' 行')
+  })
+
+  test('右键落在已选中的行上 → 菜单变成「删除选中的 N 项」', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    let host = await h.mount()
+    let rows = threeRowsHost(h, host)
+    rows[0].props.onClick({})
+    await h.settle(2)
+    host = h.renderTree()
+    rows = threeRowsHost(h, host)
+    rows[1].props.onClick({ ctrlKey: true })
+    await h.settle(2)
+    host = h.renderTree()
+    rows = threeRowsHost(h, host)
+
+    rows[0].props.onContextMenu({
+      preventDefault() {}, stopPropagation() {},
+      clientX: 100, clientY: 100, currentTarget: makeElement('div'),
+    })
+    await h.settle(6)
+    host = h.renderTree()
+
+    const labels = h.byClass(host, 'mc-menuItem').map((b) => (b.children || []).flat().join(''))
+    assert.ok(
+      labels.some((l) => /删除选中的 2 项/.test(l)),
+      '多选后右键没有批量删除：' + JSON.stringify(labels),
+    )
+    assert.ok(
+      labels.some((l) => /转移选中的 2 项/.test(l)),
+      '多选后右键没有批量移动：' + JSON.stringify(labels),
+    )
+  })
+
+  test('多选删除：一次 /remove 带上全部 id（不是循环发 N 次）', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    let host = await h.mount()
+    let rows = threeRowsHost(h, host)
+    rows[0].props.onClick({})
+    await h.settle(2)
+    host = h.renderTree()
+    rows = threeRowsHost(h, host)
+    rows[1].props.onClick({ ctrlKey: true })
+    await h.settle(2)
+    host = h.renderTree()
+
+    // 点提示条上的「删除选中的 2 项」
+    const bar = h.byClass(host, 'mc-exSelectBar')[0]
+    assert.ok(bar, '没有多选提示条')
+    const removeBtn = (bar.children || [])
+      .flat(Infinity)
+      .find((n) => n && n.type === 'button' && /删除选中的 2 项/.test((n.children || []).flat().join('')))
+    assert.ok(removeBtn, '多选提示条上没有批量删除按钮')
+
+    h.calls.length = 0
+    removeBtn.props.onClick()
+    await h.settle(10)
+
+    const removeCalls = h.calls.filter((c) => c.path.startsWith('/api/dsh-mcloud/remove'))
+    assert.equal(removeCalls.length, 1, '批量删除应该只发一次请求，实际发了 ' + removeCalls.length + ' 次')
+    assert.deepEqual(
+      (removeCalls[0].body.fileIds || []).slice().sort(),
+      ['A', 'B'],
+      '一次请求里没带齐所有 id：' + JSON.stringify(removeCalls[0].body),
+    )
+  })
+
+  test('多选移动：一次 /move 带上全部 id 和目标目录', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    h.backend.children = {
+      '/': [
+        { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+        { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+        { id: 'DEST', name: '目标', size: 0, type: 'folder', updatedAt: '2026-11-03 10:00:00' },
+      ],
+    }
+    let host = await h.mount()
+    let rows = threeRowsHost(h, host)
+    const fileRows = rows.filter((n) => typeof n.props.onDoubleClick === 'function')
+    fileRows[0].props.onClick({})
+    await h.settle(2)
+    host = h.renderTree()
+    rows = threeRowsHost(h, host)
+    rows.filter((n) => typeof n.props.onDoubleClick === 'function')[1].props.onClick({ ctrlKey: true })
+    await h.settle(2)
+    host = h.renderTree()
+
+    const bar = h.byClass(host, 'mc-exSelectBar')[0]
+    const moveBtn = (bar.children || [])
+      .flat(Infinity)
+      .find((n) => n && n.type === 'button' && /转移选中的 2 项/.test((n.children || []).flat().join('')))
+    assert.ok(moveBtn, '多选提示条上没有批量移动按钮')
+    moveBtn.props.onClick()
+    await h.settle(10)
+    host = h.renderTree()
+
+    // 转移面板打开了，里面有「目标」这个文件夹（0.4.5 起是目录树）
+    const movePanel = h.byClass(host, 'mc-movePanel')[0]
+    assert.ok(movePanel, '没有打开转移面板')
+
+    const destRow = host.find(
+      (n) => String((n.props && n.props.className) || '').includes('mc-exTreeNode') &&
+        JSON.stringify(n).includes('mc-mvNode') &&
+        JSON.stringify(n).includes('目标'),
+    )
+    assert.ok(destRow, '转移树里没有列出目标文件夹')
+
+    /**
+     * 0.4.5：转移面板是目录树 —— **单击节点就把它选成目标**（不再需要双击进入）。
+     * 双击在树里是「展开/收起」，和左树一致。
+     */
+    h.calls.length = 0
+    destRow.props.onClick({ stopPropagation() {} })
+    await h.settle(10)
+    host = h.renderTree()
+
+    const confirmBtn = host.find(
+      (n) => n.type === 'button' && /转移 2 项到/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(confirmBtn, '底部按钮没有体现「转移 2 项」')
+    confirmBtn.props.onClick()
+    await h.settle(12)
+
+    const moveCalls = h.calls.filter((c) => c.path.startsWith('/api/dsh-mcloud/move'))
+    assert.equal(moveCalls.length, 1, '批量移动应该只发一次请求')
+    assert.deepEqual(
+      (moveCalls[0].body.fileIds || []).slice().sort(),
+      ['A', 'B'],
+      '一次请求里没带齐所有 id：' + JSON.stringify(moveCalls[0].body),
+    )
+    assert.equal(moveCalls[0].body.toParentFileId, 'DEST', '目标目录不对')
+  })
+})
+
+// ================================================================
+// 0.4.5 第 3 条：转移面板 = 首页左侧那样的目录树
+// ----------------------------------------------------------------
+// 用户原话：「转移文件面板是要做成首页左侧文件夹那样的样式，重新修改，
+//            不是这种点完一级上级就没了」
+// 所以断言的重点是：**展开下级之后，上级仍然在屏幕上**。
+// ================================================================
+describe('0.4.5 第 3 条：转移面板是树，上级不会消失', () => {
+  /** 在右侧列表里按文件名找那一行（.mc-exRow + 文本匹配）。 */
+  function rowByText(host, text) {
+    return host.find(
+      (n) => String((n.props && n.props.className) || '').split(/\s+/).includes('mc-exRow') &&
+        JSON.stringify(n).includes(text),
+    )
+  }
+
+  /** 打开「转移到…」面板（右键 → 菜单项）。 */
+  async function openMovePanelFor(h, rowText) {
+    let host = h.renderTree()
+    const row = rowByText(host, rowText)
+    assert.ok(row, '找不到那一行：' + rowText)
+    row.props.onContextMenu({
+      preventDefault() {}, stopPropagation() {},
+      clientX: 100, clientY: 100, currentTarget: makeElement('div'),
+    })
+    await h.settle(6)
+    host = h.renderTree()
+    const moveItem = host.find(
+      (n) => String((n.props && n.props.className) || '').includes('mc-menuItem') &&
+        /转移到/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(moveItem, '右键菜单里没有「转移到…」')
+    moveItem.props.onMouseDown({ preventDefault() {}, stopPropagation() {} })
+    await h.settle(10)
+    return h.renderTree()
+  }
+
+  /**
+   * 在转移树里按名字找节点。
+   *
+   * 树节点的结构是：
+   *   div[key=mvtnX]
+   *     ├─ div.mc-exTreeNode.mc-mvNode      ← 这一行（点击 / 双击挂这儿）
+   *     └─ div.mc-exTreeKids                ← 子孙
+   *
+   * 所以「按名字找」= 找那个 .mc-mvNode 本体的文本等于 name。
+   * 注意不能对整棵子树做 JSON.stringify 匹配 —— 父节点会把自己的子孙也包含进去，
+   * 那样「一层」永远能在根节点那一大坨里命中，测出来的东西是假的。
+   */
+  function moveNode(host, name) {
+    return host.find((n) => {
+      const cls = String((n.props && n.props.className) || '')
+      if (!cls.split(/\s+/).includes('mc-mvNode')) return false
+      const label = (n.children || [])
+        .flat(Infinity)
+        .filter((c) => c && typeof c === 'object' && String((c.props && c.props.className) || '').includes('mc-exTreeName'))
+        .map((c) => (c.children || []).flat(Infinity).join(''))
+        .join('')
+      return label === name
+    })
+  }
+
+  test('展开下级后，根和上级都还在（不是「点完一级上级就没了」）', async () => {
+    const h = createHarness()
+    h.backend.children = {
+      '/': [
+        { id: 'src', name: '要移动的.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+        { id: 'L1', name: '一层', size: 0, type: 'folder', updatedAt: '2026-11-02 10:00:00' },
+      ],
+      L1: [{ id: 'L2', name: '二层', size: 0, type: 'folder', updatedAt: '2026-11-03 10:00:00' }],
+      L2: [{ id: 'L3', name: '三层', size: 0, type: 'folder', updatedAt: '2026-11-04 10:00:00' }],
+    }
+    await h.mount()
+    let host = await openMovePanelFor(h, '要移动的.txt')
+
+    // 一开始只有根 + 一层
+    assert.ok(moveNode(host, '一层'), '转移树里没有「一层」')
+
+    // 双击「一层」= 展开（树里的双击是展开，不是「跳走」）
+    moveNode(host, '一层').props.onDoubleClick()
+    await h.settle(12)
+    host = h.renderTree()
+
+    // 🔴 关键：展开之后，「一层」**还在**，而且「二层」出现了
+    assert.ok(moveNode(host, '一层'), '展开后上一级「一层」消失了（又变成点一下上级就没了）')
+    assert.ok(moveNode(host, '二层'), '双击没有展开出「二层」')
+
+    // 再展开二层，三层出现，且「一层」「二层」都还在
+    moveNode(host, '二层').props.onDoubleClick()
+    await h.settle(12)
+    host = h.renderTree()
+
+    assert.ok(moveNode(host, '一层'), '展开两层后「一层」消失了')
+    assert.ok(moveNode(host, '二层'), '展开两层后「二层」消失了')
+    assert.ok(moveNode(host, '三层'), '没有展开出「三层」')
+
+    // 根节点也一直可见
+    const rootNode = host.find(
+      (n) => String((n.props && n.props.className) || '').includes('mc-mvNode') &&
+        JSON.stringify(n).includes('"mc-exTreeName"'),
+    )
+    assert.ok(rootNode, '根节点不见了')
+  })
+
+  test('单击节点 = 选中为目标（不需要双击进入）', async () => {
+    const h = createHarness()
+    h.backend.children = {
+      '/': [
+        { id: 'src', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+        { id: 'DEST', name: '目标', size: 0, type: 'folder', updatedAt: '2026-11-02 10:00:00' },
+      ],
+    }
+    await h.mount()
+    let host = await openMovePanelFor(h, 'a.txt')
+
+    h.calls.length = 0
+    moveNode(host, '目标').props.onClick({ stopPropagation() {} })
+    await h.settle(10)
+    host = h.renderTree()
+
+    // 单击不该发列表请求（不跳转，只是选中）
+    assert.equal(
+      h.calls.filter((c) => c.path.startsWith('/api/dsh-mcloud/list')).length,
+      0,
+      '单击节点就发了列表请求（又变成「点一下就跳走」了）',
+    )
+    // 底部按钮应该已经指向「目标」
+    const confirmBtn = host.find(
+      (n) => n.type === 'button' && /转移到「目标」/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(confirmBtn, '单击选中后底部按钮没有指向「目标」')
+  })
+
+  test('🔴 子目录必须显示三角标（否则用户以为「只有 / 这一层」）', async () => {
+    const h = createHarness()
+    h.backend.children = {
+      '/': [
+        { id: 'src', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+        { id: 'L1', name: '一层', size: 0, type: 'folder', updatedAt: '2026-11-02 10:00:00' },
+      ],
+      // 一层里面有子目录 → 它必须显示三角标
+      L1: [{ id: 'L2', name: '二层', size: 0, type: 'folder', updatedAt: '2026-11-03 10:00:00' }],
+    }
+    await h.mount()
+    const host = await openMovePanelFor(h, 'a.txt')
+
+    const node = moveNode(host, '一层')
+    assert.ok(node, '转移树里没有「一层」')
+
+    // 三角标是嵌在 <button.mc-exTreeToggle> 里的 <span.mc-exCaretSlot>，
+    // 所以要**递归**找（flat 只摊平数组，不会钻进对象）
+    function findByClass(root, cls) {
+      if (!root || typeof root !== 'object') return null
+      const own = String((root.props && root.props.className) || '')
+      if (own.split(/\s+/).includes(cls)) return root
+      for (const child of root.children || []) {
+        const hit = findByClass(child, cls)
+        if (hit) return hit
+      }
+      return null
+    }
+
+    const caret = findByClass(node, 'mc-exCaretSlot')
+    assert.ok(caret, '「一层」那一行没有三角标格子')
+
+    const caretSvg = findByClass(node, 'mc-exCaret')
+    assert.ok(
+      caretSvg,
+      '🔴「一层」里有子目录，但三角标是留白 —— 用户会以为这一层下面没东西，' +
+        '于是以为「转移面板只有 / 目录下的文件」',
+    )
+  })
+
+  test('三角标可以收起：收起后下级隐藏、上级仍在', async () => {    const h = createHarness()
+    h.backend.children = {
+      '/': [
+        { id: 'src', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+        { id: 'L1', name: '一层', size: 0, type: 'folder', updatedAt: '2026-11-02 10:00:00' },
+      ],
+      L1: [{ id: 'L2', name: '二层', size: 0, type: 'folder', updatedAt: '2026-11-03 10:00:00' }],
+    }
+    await h.mount()
+    let host = await openMovePanelFor(h, 'a.txt')
+
+    moveNode(host, '一层').props.onDoubleClick()
+    await h.settle(12)
+    host = h.renderTree()
+    assert.ok(moveNode(host, '二层'), '没有展开出「二层」')
+
+    // 找到「一层」那一行里的三角标按钮，点它收起
+    const target = moveNode(host, '一层')
+    const toggle = (target.children || [])
+      .flat(Infinity)
+      .find((c) => c && String((c.props && c.props.className) || '').includes('mc-exTreeToggle'))
+    assert.ok(toggle, '树节点里没有三角标按钮')
+    toggle.props.onClick({ stopPropagation() {} })
+    await h.settle(10)
+    host = h.renderTree()
+
+    assert.ok(moveNode(host, '一层'), '收起后「一层」自己不见了')
+    assert.ok(!moveNode(host, '二层'), '收起后「二层」还显示着')
+  })
+
+  test('不能把文件夹转移进它自己里面（树里标记为不可选）', async () => {
+    const h = createHarness()
+    h.backend.children = {
+      '/': [
+        { id: 'DIR', name: '照片', size: 0, type: 'folder', updatedAt: '2026-11-01 10:00:00' },
+        { id: 'OTHER', name: '别处', size: 0, type: 'folder', updatedAt: '2026-11-02 10:00:00' },
+      ],
+      DIR: [{ id: 'SUB', name: '子目录', size: 0, type: 'folder', updatedAt: '2026-11-03 10:00:00' }],
+    }
+    let host = await h.mount()
+    host = await openMovePanelFor(h, '照片')
+
+    // 展开「照片」，它的子目录应该被标成不可选
+    moveNode(host, '照片').props.onDoubleClick()
+    await h.settle(12)
+    host = h.renderTree()
+
+    const sub = moveNode(host, '子目录')
+    assert.ok(sub, '没有展开出子目录')
+    assert.match(
+      JSON.stringify(sub),
+      /mc-mvNodeDisabled|moveInside/,
+      '往自己里面搬的节点没有被标记为不可选',
+    )
+  })
+})
+
+// ================================================================
+// 0.4.4 第 7 条：重命名不再依赖 window.prompt（Electron 里它永远返回 null）
+// ================================================================
+describe('0.4.4 第 7 条：重命名真的能改名', () => {
+  test('即使 window.prompt 不可用，重命名也能发出 /rename', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'DIR1', name: '旧名字', size: 0, type: 'folder', updatedAt: '2026-11-01 10:00:00' },
+    ]
+
+    let host = await h.mount()
+    const row = host.find(
+      (n) => String((n.props && n.props.className) || '').includes('mc-exRow') &&
+        typeof n.props.onContextMenu === 'function',
+    )
+    assert.ok(row, '没有渲染出文件夹行')
+    row.props.onContextMenu({
+      preventDefault() {}, stopPropagation() {},
+      clientX: 100, clientY: 100, currentTarget: makeElement('div'),
+    })
+    await h.settle(6)
+    host = h.renderTree()
+    const renameItem = host.find(
+      (n) => String((n.props && n.props.className) || '').includes('mc-menuItem') &&
+        /重命名/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(renameItem, '右键菜单里没有「重命名」')
+
+    renameItem.props.onMouseDown({ preventDefault() {}, stopPropagation() {} })
+    await h.settle(8)
+    host = h.renderTree()
+
+    // 应该是面板内的输入框，而不是浏览器原生 prompt
+    const input = host.find(
+      (n) => n.type === 'input' &&
+        String((n.props && n.props.value) || '') === '旧名字' &&
+        String((n.props && n.props.className) || '').includes('mc-input'),
+    )
+    assert.ok(input, '点重命名没有出现输入框（是不是又用回 window.prompt 了？）')
+
+    h.calls.length = 0
+    input.props.onChange({ target: { value: '新名字' } })
+    await h.settle(4)
+    host = h.renderTree()
+    const saveBtn = host.find(
+      (n) => n.type === 'button' && (n.children || []).flat().join('').trim() === '保存',
+    )
+    assert.ok(saveBtn, '重命名弹层里没有「保存」')
+    saveBtn.props.onClick()
+    await h.settle(12)
+
+    const renameCall = h.calls.find((c) => c.path.startsWith('/api/dsh-mcloud/rename'))
+    assert.ok(renameCall, '没有发出 /rename（重命名还是无效）')
+    assert.equal(renameCall.body.fileId, 'DIR1')
+    assert.equal(renameCall.body.name, '新名字')
+  })
+
+  test('名字没改时不会白发一次请求', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'DIR1', name: '同名', size: 0, type: 'folder', updatedAt: '2026-11-01 10:00:00' },
+    ]
+    let host = await h.mount()
+    const row = host.find(
+      (n) => String((n.props && n.props.className) || '').includes('mc-exRow') &&
+        typeof n.props.onContextMenu === 'function',
+    )
+    row.props.onContextMenu({
+      preventDefault() {}, stopPropagation() {},
+      clientX: 100, clientY: 100, currentTarget: makeElement('div'),
+    })
+    await h.settle(6)
+    host = h.renderTree()
+    const renameItem = host.find(
+      (n) => String((n.props && n.props.className) || '').includes('mc-menuItem') &&
+        /重命名/.test((n.children || []).flat().join('')),
+    )
+    renameItem.props.onMouseDown({ preventDefault() {}, stopPropagation() {} })
+    await h.settle(8)
+    host = h.renderTree()
+
+    h.calls.length = 0
+    const saveBtn = host.find(
+      (n) => n.type === 'button' && (n.children || []).flat().join('').trim() === '保存',
+    )
+    saveBtn.props.onClick()
+    await h.settle(10)
+
+    assert.equal(
+      h.calls.filter((c) => c.path.startsWith('/api/dsh-mcloud/rename')).length,
+      0,
+      '名字没变也发了 /rename',
+    )
+  })
+})
+
+// ================================================================
+// 0.4.4 第 8 条：面板边缘不再能拖动外层对话区宽度
+// ================================================================
+describe('0.4.4 第 8 条：本页签挂载时关掉 DSH 的对话区宽度手柄', () => {
+  test('挂载时把 [data-width-handle] 藏掉，卸载时还原', async () => {
+    const h = createHarness()
+
+    // 造两条和 DSH 一模一样的宽度手柄
+    function makeHandle(side) {
+      const el = makeElement('div')
+      el.dataset = { widthHandle: side }
+      el.style = { display: '' }
+      return el
+    }
+    const left = makeHandle('left')
+    const right = makeHandle('right')
+    h.docHandles = [left, right]
+    h.doc.querySelectorAll = (selector) => {
+      if (selector === '[data-width-handle]') return h.docHandles
+      return { length: 0, item: () => null }
+    }
+
+    await h.mount()
+    assert.equal(left.style.display, 'none', '左手柄没被关掉（还能拖外层对话区宽度）')
+    assert.equal(right.style.display, 'none', '右手柄没被关掉')
+
+    // 卸载 = 切走这个页签
+    h.unmountView()
+    await h.settle(2)
+    assert.equal(left.style.display, '', '卸载后没把左手柄还原')
+    assert.equal(right.style.display, '', '卸载后没把右手柄还原')
+  })
+})
+
+// ================================================================
+// 0.4.6 第 2 条：多选模式是**开关**
+// ----------------------------------------------------------------
+// 用户原话：「名称左边改成一个按钮叫多选按钮，没点之前就和之前版本那样，
+//            点了之后就变成现在的样子」
+//
+// 所以断言三件事：
+//   1. 默认**没有**复选框（和 0.4.3 一样干净）；
+//   2. 点「多选」之后复选框出现、能勾、提示条出现；
+//   3. 再点一次退出：复选框消失，选中集合也被清空（不留隐形状态）。
+// ================================================================
+describe('0.4.6 第 2 条：多选是开关，默认和旧版一样', () => {
+  const rowChecksOf = (nodes) => nodes.filter(
+    (n) => n.type === 'input' &&
+      String((n.props && n.props.className) || '').includes('mc-exRowCheck') &&
+      String((n.props && n.props.title) || '') === '选中这一项（可多选）',
+  )
+  const allChecksOf = (nodes) => nodes.filter(
+    (n) => n.type === 'input' && String((n.props && n.props.className) || '').includes('mc-exRowCheck'),
+  )
+  const multiBtnOf = (host) => host.find(
+    (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exMultiBtn'),
+  )
+
+  test('默认没有复选框和多选条（和 0.4.3 一样）', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    const host = await h.mount()
+
+    assert.equal(allChecksOf(host).length, 0, '默认就画了复选框（用户要求默认和旧版一样）')
+    assert.equal(h.byClass(host, 'mc-exSelectBar').length, 0, '默认不该出现多选提示条')
+    // 但「多选」按钮必须在（那是入口）
+    const btn = multiBtnOf(host)
+    assert.ok(btn, '「名称」左边没有多选按钮')
+    assert.match(JSON.stringify(btn), /多选/, '按钮上没有「多选」字样')
+  })
+
+  test('点按钮进入多选：复选框出现，勾两项就出提示条和批量动作', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    let host = await h.mount()
+
+    multiBtnOf(host).props.onClick()
+    await h.settle(6)
+    host = h.renderTree()
+
+    const rowChecks = rowChecksOf(allChecksOf(host))
+    assert.equal(rowChecks.length, 2, '进入多选后两行应各有复选框，实际 ' + rowChecks.length)
+    assert.equal(allChecksOf(host).length, 3, '还应有列头全选，实际总数 ' + allChecksOf(host).length)
+
+    rowChecks[0].props.onChange()
+    await h.settle(4)
+    host = h.renderTree()
+    let bar = h.byClass(host, 'mc-exSelectBar')[0]
+    assert.ok(bar, '勾了一项却没有出现多选提示条')
+
+    rowChecksOf(allChecksOf(host))[1].props.onChange()
+    await h.settle(4)
+    host = h.renderTree()
+    bar = h.byClass(host, 'mc-exSelectBar')[0]
+    assert.match(JSON.stringify(bar), /已选 2 项/, '勾选两个后计数不对')
+    const barText = JSON.stringify(bar)
+    assert.match(barText, /删除选中的 2 项/, '多选提示条上没有「删除」')
+    assert.match(barText, /转移选中的 2 项/, '多选提示条上没有「转移」')
+  })
+
+  test('再点一次退出：复选框消失，选中集合也清空（不留隐形状态）', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    let host = await h.mount()
+
+    multiBtnOf(host).props.onClick()
+    await h.settle(6)
+    host = h.renderTree()
+    rowChecksOf(allChecksOf(host))[0].props.onChange()
+    await h.settle(4)
+    host = h.renderTree()
+    assert.ok(h.byClass(host, 'mc-exSelectBar')[0], '进入多选并勾选后应有提示条')
+
+    // 退出多选
+    multiBtnOf(host).props.onClick()
+    await h.settle(6)
+    host = h.renderTree()
+
+    assert.equal(allChecksOf(host).length, 0, '退出后复选框没消失')
+    assert.equal(
+      h.byClass(host, 'mc-exSelectBar').length,
+      0,
+      '退出后多选提示条还在（说明选中集合没清空，会留下隐形状态）',
+    )
+  })
+
+  test('多选模式下点行 = 勾选，不需要按 Ctrl', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    let host = await h.mount()
+
+    multiBtnOf(host).props.onClick()
+    await h.settle(6)
+    host = h.renderTree()
+
+    const rowsOf = () => h.renderTree().filter(
+      (n) => String((n.props && n.props.className) || '').split(/\s+/).includes('mc-exRow'),
+    )
+    // 普通点击（没有 ctrlKey）就该勾上
+    rowsOf()[0].props.onClick({})
+    await h.settle(4)
+    host = h.renderTree()
+    let selected = host.filter(
+      (n) => String((n.props && n.props.className) || '').includes('mc-exRowSelected'),
+    )
+    assert.equal(selected.length, 1, '多选模式下点行没有勾上')
+
+    // 再点同一个 = 取消勾选
+    rowsOf()[0].props.onClick({})
+    await h.settle(4)
+    host = h.renderTree()
+    selected = host.filter(
+      (n) => String((n.props && n.props.className) || '').includes('mc-exRowSelected'),
+    )
+    assert.equal(selected.length, 0, '多选模式下再点一次没有取消勾选')
+  })
+
+  test('点复选框不会顺带触发「点行」把选择又清掉', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+    ]
+    let host = await h.mount()
+    multiBtnOf(host).props.onClick()
+    await h.settle(6)
+    host = h.renderTree()
+
+    const check = rowChecksOf(allChecksOf(host))[0]
+    assert.ok(check, '进入多选后没有行复选框')
+    assert.equal(typeof check.props.onClick, 'function', '复选框没有 onClick（拦不住冒泡）')
+
+    let stopped = false
+    check.props.onClick({ stopPropagation() { stopped = true } })
+    assert.ok(stopped, '复选框没有阻止冒泡 —— 点它会顺带触发点行，把选择清掉')
+
+    check.props.onChange()
+    await h.settle(4)
+    host = h.renderTree()
+    const selected = host.filter(
+      (n) => String((n.props && n.props.className) || '').includes('mc-exRowSelected'),
+    )
+    assert.equal(selected.length, 1, '勾选之后那一行没有进入选中态')
+  })
+
+  test('列头全选：一次选中所有可见行，再点一次全清', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+      { id: 'C', name: 'c.txt', size: 3, type: 'file', updatedAt: '2026-11-03 10:00:00' },
+    ]
+    let host = await h.mount()
+    multiBtnOf(host).props.onClick()
+    await h.settle(6)
+    host = h.renderTree()
+
+    const allBox = () => h.renderTree().find(
+      (n) => n.type === 'input' && String((n.props && n.props.className) || '').includes('mc-exRowCheck') &&
+        String((n.props && n.props.title) || '').includes('全选'),
+    )
+    let box = allBox()
+    assert.ok(box, '列头没有全选复选框')
+
+    box.props.onChange()
+    await h.settle(6)
+    host = h.renderTree()
+    let bar = h.byClass(host, 'mc-exSelectBar')[0]
+    assert.match(JSON.stringify(bar), /已选 3 项/, '全选没有选中全部 3 行')
+
+    box = allBox()
+    box.props.onChange()
+    await h.settle(6)
+    host = h.renderTree()
+    bar = h.byClass(host, 'mc-exSelectBar')[0]
+    assert.equal(bar, undefined, '再点一次全选没有清空选择')
+  })
+})
+
+// ================================================================
+// 0.4.8 布局 / 配色：两个「看着就难受」的真 bug
+// ----------------------------------------------------------------
+// 1. 「多选按钮和名称糊一块儿，下面的文件也显示不完全，名字被截断」
+//    —— 按钮被塞进了 display:grid 的 .mc-exCols，占掉第一个网格列（复选框列），
+//       整条网格往后错一格：按钮和「名称」挤在一起，名称列被挤出可视区。
+// 2. 「点了是选中色，鼠标移上去又和没选一样」
+//    —— hover 用的 LAYER_1(0.06) 比 selected 的 LAYER_2(0.12) 还浅，
+//       而且选择器顺序让 hover 盖掉了选中态。
+// ================================================================
+describe('0.4.8：多选按钮不能挤坏列头，选中色必须压过 hover', () => {
+  test('多选按钮不占网格列，也不额外挤压网格宽度', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+    ]
+    const host = await h.mount()
+
+    const btn = host.find(
+      (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exMultiBtn'),
+    )
+    assert.ok(btn, '找不到多选按钮')
+
+    const cols = h.byClass(host, 'mc-exCols')[0]
+    assert.ok(cols, '找不到列头网格 .mc-exCols')
+
+    // ① 网格自己的子元素里不能有那个按钮（不能占掉第一个网格列）
+    const gridChildren = (cols.children || []).flat(Infinity).filter((c) => c && typeof c === 'object')
+    const btnInGrid = gridChildren.some(
+      (c) => c.type === 'button' && String((c.props && c.props.className) || '').includes('mc-exMultiBtn'),
+    )
+    assert.equal(
+      btnInGrid,
+      false,
+      '🔴 多选按钮被塞进了 .mc-exCols（display:grid）—— 它会占掉第一个网格列，把「名称」列挤出去',
+    )
+
+    // ② 不能再用「外面包一层 flex」（0.4.8 的错法：压缩网格宽度）
+    assert.equal(
+      h.byClass(host, 'mc-exColsRow').length,
+      0,
+      '🔴 还在用 .mc-exColsRow 包 flex —— 网格宽度被压缩，名称列仍会被挤',
+    )
+
+    // ③ 也不能用绝对定位 + 手算 padding（0.4.9/10 的错法）
+    assert.equal(
+      h.byClass(host, 'mc-exColsHost').length,
+      0,
+      '🔴 还在用 .mc-exColsHost 绝对定位 —— 手算宽度必然差几像素',
+    )
+
+    // ④ 正确：按钮是列头网格里的一个普通格子
+    const multiCell = h.byClass(host, 'mc-exColsMultiCell')[0]
+    assert.ok(multiCell, '没有 .mc-exColsMultiCell（按钮该是网格里的一个普通格子）')
+    const inGrid = gridChildren.some(
+      (c) => String((c.props && c.props.className) || '').includes('mc-exColsMultiCell'),
+    )
+    assert.equal(inGrid, true, '按钮格子不是网格的直接子元素 —— 宽度不会被一起分配')
+  })
+
+  /**
+   * 🔴 0.4.12 的真根因：**网格子元素个数必须等于列数**。
+   *
+   * 用户截图里未开多选时：名字整段消失、大小右移、时间被切。
+   * 因为那一格的复选框被 `null` 掉了 → 行只剩 3 个子元素 →
+   * 名称被塞进 0px 的复选框列（裁没），大小进名称列，时间进大小列。
+   *
+   * 0.4.13 改成 4 列 4 格（名称 / 复选框 / 大小 / 时间），
+   * 列头与行**完全同构**，两个方向都钉住。
+   */
+  test('网格子元素个数必须等于列数（否则整行错位）', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+    ]
+
+    // 未开多选（用户截图里出问题的状态）
+    const host = await h.mount()
+    const cols = h.byClass(host, 'mc-exCols')[0]
+    assert.ok(cols, '找不到列头网格')
+
+    const countCells = (node, classes) => {
+      let n = 0
+      const walk = (cur) => {
+        if (!cur || typeof cur !== 'object') return
+        const cls = String((cur.props && cur.props.className) || '')
+        if (classes.some((c) => cls.split(/\s+/).includes(c))) n += 1
+        for (const child of cur.children || []) walk(child)
+      }
+      walk(node)
+      return n
+    }
+
+    // 列头 4 格：名称 / 复选框+多选 / 大小 / 时间
+    const headCells = countCells(cols, [
+      'mc-exColsName', 'mc-exColsMultiCell', 'mc-exColsSize', 'mc-exColsTime',
+    ])
+    assert.equal(
+      headCells,
+      4,
+      '🔴 列头有 ' + headCells + ' 个格子，但网格定义了 4 列 —— 会整体错位',
+    )
+
+    // 行 4 格：名称 / 复选框 / 大小 / 时间
+    const row = host.find(
+      (n) => String((n.props && n.props.className) || '').split(/\s+/).includes('mc-exRow'),
+    )
+    assert.ok(row, '没渲染出行')
+    const rowCells = countCells(row, [
+      'mc-exRowName', 'mc-exRowCheckCell', 'mc-exRowSize', 'mc-exRowTime',
+    ])
+    assert.equal(
+      rowCells,
+      4,
+      '🔴 行有 ' + rowCells + ' 个网格格子，但定义了 4 列 —— 会错位' +
+        '（**未开多选时也必须渲染复选框那一格**，否则名字会被塞进 0 宽列）',
+    )
+  })
+
+  test('列头的网格列数与行一致（同一套 4 列模板）', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+    ]
+    const host = await h.mount()
+
+    // 列头和行必须用**同一套** grid-template-columns（顺序也一致）
+    const colsTpl = (SRC.match(/\.mc-exCols\{[^}]*grid-template-columns:([^;]+);/) || [])[1] || ''
+    const rowTpl = (SRC.match(/\.mc-exRow\{[^}]*grid-template-columns:([^;]+);/) || [])[1] || ''
+    assert.ok(colsTpl && rowTpl, '没提取到网格模板')
+    assert.equal(
+      colsTpl.trim(),
+      rowTpl.trim(),
+      '🔴 列头和行的网格模板不一致 —— 上下必然错位\n列头：' + colsTpl + '\n行  ：' + rowTpl,
+    )
+
+    const row = host.find(
+      (n) => String((n.props && n.props.className) || '').split(/\s+/).includes('mc-exRow'),
+    )
+    assert.ok(row, '没渲染出行')
+    const cells = (row.children || []).flat(Infinity).filter((c) => c && typeof c === 'object')
+    const nameCell = cells.find(
+      (c) => String((c.props && c.props.className) || '').includes('mc-exRowName'),
+    )
+    assert.ok(nameCell, '行里没有名称单元格')
+  })
+
+  test('选中色不能和 hover 混为一谈（CSS 层级与颜色都要分开）', async () => {
+    const src = SRC
+
+    // 1) 选中态必须显式覆盖 hover，否则鼠标一移上去就「看起来没选中」
+    assert.match(
+      src,
+      /\.mc-exRowSelected,\.mc-exRowSelected:hover\{background:/,
+      '没有 `.mc-exRowSelected,.mc-exRowSelected:hover` 规则 —— hover 会盖掉选中色',
+    )
+
+    // 2) 树节点同理（转移面板选目标就是这种情形）
+    assert.match(
+      src,
+      /\.mc-exTreeNodeActive:hover/,
+      '树节点没有 `选中:hover` 规则 —— 转移面板里鼠标移上去选中色会消失',
+    )
+
+    // 3) 选中色必须是独立的变量，不能复用 LAYER_1/LAYER_2
+    assert.match(src, /var SELECT_BG = /, '没有独立的 SELECT_BG 变量')
+    const selectLine = (src.match(/var SELECT_BG = '([^']+)'/) || [])[1] || ''
+    assert.ok(selectLine && !/LAYER_/.test(selectLine), 'SELECT_BG 复用了 LAYER 变量：' + selectLine)
+
+    // 4) 选中色不能太亮（0.4.9：用户说「多选点完之后太亮了」）
+    //    取 rgba(...) 里最后一个数字当透明度，必须 <= 0.10
+    const alphaMatch = selectLine.match(/rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*([\d.]+)\s*\)/)
+    assert.ok(alphaMatch, 'SELECT_BG 里没解析出 rgba 透明度：' + selectLine)
+    const alpha = Number(alphaMatch[1])
+    assert.ok(
+      alpha <= 0.1,
+      '🔴 SELECT_BG 透明度 ' + alpha + ' 太亮了（用户反馈整列选中时刺眼），应 <= 0.10',
+    )
+  })
+
+  /**
+   * 0.4.10：两个残留的问题，各来一条断言钉住。
+   *
+   * 1. 「不点多选时名称还是被遮住，点了多选反而不遮」
+   *    —— 两档预留宽度不一致（或按钮比预留宽）。现在统一用 --mc-multi-w。
+   * 2. 「点多选之后按钮变白，字看不见了」
+   *    —— ON 态原来写 `color:#fff`，遇到浅色品牌色就是白底白字。
+   */
+  /**
+   * 0.4.11：这个位置改了四次，最后用「多开一列」解决。
+   *
+   * 三次错法的共同点都是**手算宽度跟自动布局对抗**：
+   *   塞进已有网格列 / 包 flex / 绝对定位 + padding-left。
+   * 现在不再算宽度 —— 列头网格多一列容纳按钮，浏览器自己分配。
+   */
+  /**
+   * 🔴 0.4.14：用户要求「点击多选后，多选和多选左边的一键选择框交换位置」。
+   *
+   * 这一格是 flex-end（内容靠右）。0.4.13 顺序是「全选框 → 多选按钮」，
+   * 视觉上全选框在左。现在对调成「多选按钮 → 全选框」，
+   * 也就是按钮固定靠左、全选框从它右侧长出来。
+   */
+  test('多选按钮在左、全选框在右（进入多选后位置不跳）', async () => {
+    const src = SRC
+
+    // 在这一格的源码片段里，按钮必须出现在复选框之前
+    const cellStart = src.indexOf("className: 'mc-exColsMultiCell'")
+    assert.ok(cellStart > 0, '找不到 .mc-exColsMultiCell')
+    const seg = src.slice(cellStart, cellStart + 1600)
+    const btnAt = seg.indexOf('mc-exMultiBtn')
+    const checkAt = seg.indexOf('mc-exRowCheck')
+    assert.ok(btnAt >= 0, '这一格里没有多选按钮')
+    assert.ok(checkAt >= 0, '这一格里没有全选框')
+    assert.ok(
+      btnAt < checkAt,
+      '🔴 顺序还是「全选框在前」—— 用户要求对调：多选按钮在左、全选框在右',
+    )
+  })
+
+  /**
+   * 🔴 0.4.14 用户补充：「一键选择框要和下面的选择框对齐」。
+   *
+   * 也就是列头的全选框必须和每一行的复选框**竖直对齐**。
+   * 这两个格子在不同容器里（一个在列头网格、一个在行网格），
+   * 要对齐就必须满足：
+   *   ① 它们是各自网格的**同一列**（模板一致）；
+   *   ② 内容都靠右（flex-end），且右内边距相同。
+   * 任何一条不满足都会左右错开几像素。
+   */
+  test('列头全选框必须和行复选框竖直对齐', async () => {
+    const src = SRC
+
+    // ① 取两个格子的 CSS 规则
+    const multiCell = (src.match(/\.mc-exColsMultiCell\{[^}]*\}/) || [])[0] || ''
+    const checkCell = (src.match(/\.mc-exRowCheckCell\{[^}]*\}/) || [])[0] || ''
+    assert.ok(multiCell && checkCell, '没找到这两个格子的规则')
+
+    // ② 都必须靠右
+    assert.match(multiCell, /justify-content:flex-end/, '列头第2格没有靠右对齐')
+    assert.match(checkCell, /justify-content:flex-end/, '行第2格没有靠右对齐')
+
+    // ③ 右内边距必须一致（否则复选框会左右错开）
+    const rightPad = (rule) => {
+      const m = rule.match(/padding(?:-right)?:\s*([^;}]+)/)
+      if (!m) return null
+      const v = m[1].trim()
+      // padding:0 6px 0 0 → 取第 2 个值；padding-right:6px → 取自身
+      const parts = v.split(/\s+/)
+      return parts.length === 1 ? parts[0] : (parts.length === 2 ? parts[1] : parts[1])
+    }
+    const a = rightPad(multiCell)
+    const b = rightPad(checkCell)
+    assert.equal(
+      a,
+      b,
+      '🔴 两个格子的右内边距不一致（列头 ' + a + ' vs 行 ' + b + '）—— 全选框和行复选框会左右错开',
+    )
+  })
+
+  test('多选控件紧贴「大小」左边线，名称不贴左线', async () => {
+    const src = SRC
+
+    // ① 第 2 格（复选框+多选按钮）右对齐 —— 这样它贴着「大小」左边线
+    assert.match(
+      src,
+      /\.mc-exColsMultiCell\{[^}]*justify-content:flex-end/,
+      '🔴 多选那一格没有右对齐 —— 控件不会紧贴「大小」左边线',
+    )
+    // 行里那一格同理
+    assert.match(
+      src,
+      /\.mc-exRowCheckCell\{[^}]*justify-content:flex-end/,
+      '🔴 行的复选框格没有右对齐 —— 上下对不齐',
+    )
+
+    // ② 名称列必须有足够左边距（用户：「名字不要再贴着左边的线」）
+    //    实际写的是 padding:0 8px 0 clamp(12px,1.8vw,20px)，所以取 clamp 的最小值
+    const nameRule = (src.match(/\.mc-exColsName\{[^}]*\}/) || [])[0] || ''
+    const clampMin = Number((nameRule.match(/clamp\((\d+)px/) || [])[1] || 0)
+    assert.ok(
+      clampMin >= 12,
+      '🔴 名称列左边距只有 ' + clampMin + 'px —— 还是贴着左边线\n' + nameRule,
+    )
+    // 行里的名称也要用同一档左边距
+    assert.match(
+      src,
+      /\.mc-exRowName\{[^}]*clamp\(12px/,
+      '行的名称左边距和列头不一致（或太小）',
+    )
+
+    // ③ 网格模板里第 2 列就是「check + multi」，紧跟名称列
+    assert.match(
+      src,
+      /grid-template-columns:minmax\(0,1fr\) calc\(var\(--mc-check-w[^)]*\) \+ var\(--mc-multi-w/,
+      '网格第 2 列不是「复选框 + 多选按钮」',
+    )
+  })
+
+  test('多选按钮 ON 态不能用白字（浅色主题下会看不见）', async () => {
+    const src = SRC
+
+    // 抓出所有 .mc-exMultiBtnOn 规则
+    const onRules = src.match(/\.mc-exMultiBtnOn[^']*'[^']*'/g) || []
+    assert.ok(onRules.length > 0, '找不到 .mc-exMultiBtnOn 规则')
+
+    for (const rule of onRules) {
+      assert.doesNotMatch(
+        rule,
+        /color:\s*#fff|color:\s*white|color:\s*#ffffff/i,
+        '🔴 ON 态用了白字：' + rule + ' —— 品牌色一旦是浅色/浅主题就变成白底白字',
+      )
+    }
+  })
+})
+
+// ================================================================
+// 0.4.7：删除传输**记录**（不是文件）
+// ----------------------------------------------------------------
+// 用户原话：「每处都加个一键删除记录，就把当下的传输记录全删除了；
+//            再在单个传输文件加一个删除按钮，点击就删除该文件的传输记录，
+//            注意删除的不是文件，而是记录」
+// ================================================================
+describe('0.4.7：删除传输记录（不删文件）', () => {
+  function makeJobs() {
+    return [
+      {
+        id: 'u1', kind: 'upload', label: '照片.jpg', phase: 'complete', done: 10, total: 10,
+        state: 'done', error: null, startedAt: Date.now() - 9000, finishedAt: Date.now() - 5000,
+        canRevealLocal: false, hasLocalPath: false, parentFileId: 'P1', parentPath: '/a', fileId: 'F1',
+      },
+      {
+        id: 'd1', kind: 'download', label: 'a.zip', phase: 'download', done: 5, total: 5,
+        state: 'done', error: null, startedAt: Date.now() - 8000, finishedAt: Date.now() - 4000,
+        canRevealLocal: true, hasLocalPath: true, parentFileId: null, parentPath: null,
+      },
+    ]
+  }
+
+  async function openHistoryTo(h, tab) {
+    let host = await h.mount()
+    host.find(
+      (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exHistoryBtn'),
+    ).props.onClick()
+    await h.settle(10)
+    host = h.renderTree()
+    await h.settle(8)
+    host = h.renderTree()
+    if (tab === 'upload') {
+      host.find(
+        (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exHistTab') &&
+          (n.children || []).join('').includes('上传'),
+      ).props.onClick()
+      await h.settle(10)
+      host = h.renderTree()
+      await h.settle(8)
+      host = h.renderTree()
+    }
+    return host
+  }
+
+  test('每条记录都有「删除」按钮', async () => {
+    const h = createHarness()
+    h.backend.jobs = makeJobs()
+    const host = await openHistoryTo(h, 'download')
+
+    const removeBtns = host.filter(
+      (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exHistRemove'),
+    )
+    assert.ok(removeBtns.length >= 1, '记录行里没有「删除这条记录」按钮')
+  })
+
+  test('单条删除：发 POST /transfers/remove，只带 jobId', async () => {
+    const h = createHarness()
+    h.backend.jobs = makeJobs()
+    const host = await openHistoryTo(h, 'download')
+
+    const btn = host.find(
+      (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exHistRemove'),
+    )
+    assert.ok(btn, '找不到删除按钮')
+
+    h.calls.length = 0
+    btn.props.onClick({ stopPropagation() {} })
+    await h.settle(12)
+
+    const call = h.calls.find((c) => c.path.startsWith('/api/dsh-mcloud/transfers/remove'))
+    assert.ok(call, '没有发出 /transfers/remove（实际调用：' + JSON.stringify(h.calls.map((c) => c.path)) + '）')
+    assert.ok(call.body.jobId, '请求里没带 jobId')
+    // 🔴 关键：删的是记录，请求体里不该出现任何「删文件」的字段
+    assert.equal(call.body.fileId, undefined, '请求里出现了 fileId —— 难道要删文件？')
+    assert.equal(call.body.deleteFile, undefined, '请求里出现了 deleteFile')
+  })
+
+  test('一键删除：发 POST /transfers/clear，带上当前页签的 family', async () => {
+    const h = createHarness()
+    h.backend.jobs = makeJobs()
+    const host = await openHistoryTo(h, 'upload')
+
+    const clearBtn = host.find(
+      (n) => n.type === 'button' &&
+        String((n.props && n.props.className) || '').includes('mc-btnDanger') &&
+        /一键删除/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(clearBtn, '上传页签里没有「一键删除」按钮')
+
+    h.calls.length = 0
+    clearBtn.props.onClick()
+    await h.settle(12)
+
+    const call = h.calls.find((c) => c.path.startsWith('/api/dsh-mcloud/transfers/clear'))
+    assert.ok(call, '没有发出 /transfers/clear')
+    assert.equal(call.body.family, 'upload', '一键删除没有指定 family（会误删另一页的记录）')
+  })
+
+  test('正在传输中的记录：删除按钮置灰', async () => {
+    const h = createHarness()
+    h.backend.jobs = [{
+      id: 'running1', kind: 'download', label: 'big.iso', phase: 'download', done: 1, total: 100,
+      state: 'running', error: null, startedAt: Date.now(), finishedAt: null,
+      canRevealLocal: false, hasLocalPath: false, parentFileId: null, parentPath: null,
+    }]
+    const host = await openHistoryTo(h, 'download')
+
+    const btn = host.find(
+      (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exHistRemove'),
+    )
+    assert.ok(btn, '找不到删除按钮')
+    assert.equal(btn.props.disabled, true, '传输中的记录删除按钮没有置灰')
+  })
+})
+describe('0.4.5 第 1 条：上传记录的定位要落到真正那一层', () => {
+  /** 造一条「parentPath 为 null、只有 parentFileId」的上传记录。 */
+  function uploadJobWithoutPath() {
+    return {
+      id: 'up-nopath',
+      kind: 'upload',
+      label: '照片.jpg',
+      phase: 'complete',
+      done: 100,
+      total: 100,
+      state: 'done',
+      error: null,
+      startedAt: Date.now() - 9000,
+      finishedAt: Date.now() - 5000,
+      canRevealLocal: false,
+      hasLocalPath: false,
+      parentFileId: 'DEEP',
+      // 🔴 关键：这里没有路径
+      parentPath: null,
+      fileId: 'IMG1',
+      name: '照片.jpg',
+      dedup: false,
+    }
+  }
+
+  async function openHistoryWith(h) {
+    let host = await h.mount()
+    const histBtn = host.find(
+      (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exHistoryBtn'),
+    )
+    histBtn.props.onClick()
+    await h.settle(10)
+    host = h.renderTree()
+    await h.settle(8)
+    host = h.renderTree()
+
+    const upTab = host.find(
+      (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exHistTab') &&
+        (n.children || []).join('').includes('上传'),
+    )
+    upTab.props.onClick()
+    await h.settle(10)
+    host = h.renderTree()
+    await h.settle(8)
+    return h.renderTree()
+  }
+
+  test('parentPath 为 null 时，用宿主反查的 trail 铺出完整路径（不再掉回根目录）', async () => {
+    const h = createHarness()
+    h.backend.jobs = [uploadJobWithoutPath()]
+    // 宿主反查出来的完整 trail（含每一级的真实 fileId）
+    h.backend.locatable = {
+      ok: true,
+      canReveal: true,
+      kind: 'remote',
+      reason: '',
+      path: '/Windows/实验/数字图像实验/第一周实验结果',
+      trail: [
+        { id: 'ROOT-W', name: 'Windows' },
+        { id: 'EXP', name: '实验' },
+        { id: 'DIMG', name: '数字图像实验' },
+        { id: 'DEEP', name: '第一周实验结果' },
+      ],
+    }
+
+    const host = await openHistoryWith(h)
+    const revealBtn = host.find(
+      (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exHistReveal'),
+    )
+    assert.ok(revealBtn, '上传记录没有「定位」按钮')
+
+    h.calls.length = 0
+    revealBtn.props.onClick({ stopPropagation() {} })
+    await h.settle(14)
+    const after = h.renderTree()
+    await h.settle(8)
+
+    // 关键断言：应该按 DEEP 那一层去 list，而不是根
+    const listCalls = h.calls.filter((c) => c.path.startsWith('/api/dsh-mcloud/list'))
+    assert.ok(listCalls.length > 0, '定位之后没有去拉那一层目录')
+    assert.ok(
+      listCalls.some((c) => c.path.includes('DEEP') || decodeURIComponent(c.path).includes('DEEP')),
+      '没有定位到「第一周实验结果」那一层，实际请求：' + JSON.stringify(listCalls.map((c) => c.path)),
+    )
+    assert.ok(
+      !listCalls.every((c) => String(c.path).includes('parentFileId=%2F&')),
+      '定位又掉回根目录了',
+    )
+    void after
+  })
+
+  test('宿主没给 trail 时，退而用 parentPath 的最后一段，仍然不掉回根', async () => {
+    const h = createHarness()
+    h.backend.jobs = [Object.assign(uploadJobWithoutPath(), {
+      parentPath: '/Windows/实验/数字图像实验/第一周实验结果',
+    })]
+    h.backend.locatable = { ok: true, canReveal: true, kind: 'remote', reason: '' }
+
+    const host = await openHistoryWith(h)
+    const revealBtn = host.find(
+      (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exHistReveal'),
+    )
+    h.calls.length = 0
+    revealBtn.props.onClick({ stopPropagation() {} })
+    await h.settle(14)
+    // setStack 之后要靠下一轮渲染才会触发「拉这一层目录」的 effect
+    h.renderTree()
+    await h.settle(14)
+
+    const listCalls = h.calls.filter((c) => c.path.startsWith('/api/dsh-mcloud/list'))
+    assert.ok(
+      listCalls.some((c) => c.path.includes('DEEP')),
+      '没有用 parentPath 定位到末级目录：' + JSON.stringify(listCalls.map((c) => c.path)),
+    )
   })
 })
