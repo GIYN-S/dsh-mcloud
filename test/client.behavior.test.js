@@ -159,6 +159,19 @@ function createHarness({ source = SRC } = {}) {
    * 于是「上传完成后该刷新目录」那条链根本对不上号，测试测了个寂寞。
    */
   let backendUpload = null
+  /**
+   * 🔴 0.5.4：人为给 /list 加延迟的开关。
+   *
+   * 为什么要它：乐观更新要验证的是「**网络还没回来**时界面就已经变了」。
+   * 假后端是同步返回的，settle(2) 就已经把往返走完了 —— 于是「有没有乐观更新」
+   * 测出来一模一样，A/B 对照过不了（去掉修复测试仍然绿，说明没测到真问题）。
+   *
+   * 打开之后 /list 会延迟 backendListDelayMs 毫秒，我们就能在「请求在飞」的
+   * 那一刻检查界面。
+   */
+  let backendListDelayMs = 0
+  /** 让 /move 慢下来（毫秒）。139 的 batchMove 实测确实要好几秒。 */
+  let backendMoveDelayMs = 0
   class FakeXHR {
     constructor() {
       this.upload = {}
@@ -284,6 +297,9 @@ function createHarness({ source = SRC } = {}) {
     }
 
     if (path.startsWith('/api/dsh-mcloud/list')) {
+      if (backendListDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, backendListDelayMs))
+      }
       const query = path.includes('?') ? path.slice(path.indexOf('?')) : ''
       const params = new URLSearchParams(query)
       const parent = params.get('parentFileId') || '/'
@@ -345,6 +361,64 @@ function createHarness({ source = SRC } = {}) {
       return json({ ok: true })
     }
     if (path.startsWith('/api/dsh-mcloud/reveal')) return json({ ok: true, path: 'D:\\x' })
+    /**
+     * 🔴 0.5.4：假后端以前对 /remove 和 /move 一律回 { ok:true } 但**不动数据**，
+     * 于是「删完列表里还有这个文件」这种 bug 在测试里根本看不出来（列表本来就没变）。
+     * 现在真的从 backend.items 里删 / 挪，让刷新链路可被验证。
+     */
+    if (path.startsWith('/api/dsh-mcloud/remove')) {
+      const ids = (body && Array.isArray(body.fileIds) ? body.fileIds : []).map(String)
+      backend.items = backend.items.filter((it) => !ids.includes(String(it.id)))
+      if (backend.children) {
+        for (const key of Object.keys(backend.children)) {
+          if (Array.isArray(backend.children[key])) {
+            backend.children[key] = backend.children[key].filter((it) => !ids.includes(String(it.id)))
+          }
+        }
+      }
+      return json({ ok: true, removed: ids.length })
+    }
+    if (path.startsWith('/api/dsh-mcloud/move')) {
+      if (backendMoveDelayMs > 0) {
+        await new Promise((r) => setTimeout(r, backendMoveDelayMs))
+      }
+      const ids = (body && Array.isArray(body.fileIds) ? body.fileIds : []).map(String)
+      const dest = String((body && body.toParentFileId) || '/')
+      if (!backend.children) backend.children = {}
+      /**
+       * 🔴 必须把**所有**目录里的这些 id 都摘掉，再塞进目标目录。
+       * 以前只动了 backend.items 和 children[dest]，于是「源目录」那一边
+       * （children['/']）还留着 —— 客户端 reload() 一拉又回来了，
+       * 测试就永远看到「移动后还在原位」。
+       * 顺带：源目录的 items 和 children 可能是同一个数组引用，统一用「重建」的方式改。
+       */
+      const moving = []
+      const collect = (arr) => {
+        if (!Array.isArray(arr)) return []
+        const keep = []
+        for (const it of arr) {
+          if (it && ids.includes(String(it.id))) moving.push(it)
+          else keep.push(it)
+        }
+        return keep
+      }
+      backend.items = collect(backend.items)
+      const sourceDirs = Object.keys(backend.children)
+      for (const dir of sourceDirs) {
+        backend.children[dir] = collect(backend.children[dir])
+      }
+      // 去重（同一个对象可能在 items 与 children 里各出现一次）
+      const seen = new Set()
+      const uniq = moving.filter((it) => {
+        const k = String(it && it.id)
+        if (seen.has(k)) return false
+        seen.add(k)
+        return true
+      })
+      if (!Array.isArray(backend.children[dest])) backend.children[dest] = []
+      backend.children[dest] = backend.children[dest].concat(uniq)
+      return json({ ok: true, moved: ids.length })
+    }
     /**
      * 上传（POST /upload 这条 fetch 路）：回 jobId，并**立刻**把那条任务登记成 done。
      *
@@ -478,6 +552,10 @@ function createHarness({ source = SRC } = {}) {
     unmountView,
     docHandles: [],
     doc,
+    /** 让 /list 慢下来（毫秒）。0 = 关闭。用于验证「网络没回来时界面就已经变了」。 */
+    setListDelay(ms) { backendListDelayMs = Number(ms) || 0 },
+    /** 让 /move 慢下来（毫秒）。用于验证「点下确认就生效，不等接口返回」。 */
+    setMoveDelay(ms) { backendMoveDelayMs = Number(ms) || 0 },
   }
 }
 
@@ -3170,5 +3248,661 @@ describe('0.4.5 第 1 条：上传记录的定位要落到真正那一层', () =
       listCalls.some((c) => c.path.includes('DEEP')),
       '没有用 parentPath 定位到末级目录：' + JSON.stringify(listCalls.map((c) => c.path)),
     )
+  })
+})
+
+
+// ================================================================
+// 0.5.2 用户第 1 条：正常点一下文件不该触发「多选」
+// ----------------------------------------------------------------
+// 用户原话：「正常点击文件时会触发多选的效果修复」。
+//
+// 根因：普通单击一行也会把这一行写进 selectedIds（那是资源管理器的
+// 「选中当前行」），而多选提示条的判据是 selectedIds.length > 0 ——
+// 于是点一下文件，下面就冒出「已选 1 项 / 转移 / 删除」。
+//
+// 现在的判据是 multiSelectionActive()：
+//   · 普通模式 → 必须真的加选了 2 项以上（Ctrl / Shift）；
+//   · 多选模式 → 勾 1 项就显示（那里就是批量操作的语境）。
+// ================================================================
+describe('0.5.2 第 1 条：点文件不触发多选', () => {
+  const rowsOf = (host) => host.filter(
+    (n) => String((n.props && n.props.className) || '').split(/\s+/).includes('mc-exRow'),
+  )
+
+  test('普通模式单击一行：有选中态，但不出现多选提示条', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    let host = await h.mount()
+    rowsOf(host)[0].props.onClick({})
+    await h.settle(4)
+    host = h.renderTree()
+
+    const selected = rowsOf(host).filter(
+      (n) => String(n.props.className).includes('mc-exRowSelected'),
+    )
+    assert.equal(selected.length, 1, '单击一行之后没有选中态')
+    assert.equal(
+      h.byClass(host, 'mc-exSelectBar').length,
+      0,
+      '只是点了一下文件，却冒出了多选提示条（已选 1 项 / 转移 / 删除）',
+    )
+  })
+
+  test('普通模式 Ctrl 加选到 2 项：提示条才出现', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    let host = await h.mount()
+    rowsOf(host)[0].props.onClick({})
+    await h.settle(4)
+    host = h.renderTree()
+    rowsOf(host)[1].props.onClick({ ctrlKey: true })
+    await h.settle(4)
+    host = h.renderTree()
+
+    assert.ok(
+      h.byClass(host, 'mc-exSelectBar')[0],
+      '真的加选了两项，却没有多选提示条',
+    )
+  })
+
+  test('多选模式里勾 1 项：提示条照旧出现（那里就是批量语境）', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+    ]
+    let host = await h.mount()
+    const multiBtn = host.find(
+      (n) => n.type === 'button' && String((n.props && n.props.className) || '').includes('mc-exMultiBtn'),
+    )
+    multiBtn.props.onClick()
+    await h.settle(6)
+    host = h.renderTree()
+
+    const rowCheck = host.find(
+      (n) => n.type === 'input' &&
+        String((n.props && n.props.className) || '').includes('mc-exRowCheck') &&
+        String((n.props && n.props.title) || '') === '选中这一项（可多选）',
+    )
+    rowCheck.props.onChange()
+    await h.settle(4)
+    host = h.renderTree()
+    assert.ok(h.byClass(host, 'mc-exSelectBar')[0], '多选模式下勾一项应有提示条')
+  })
+})
+
+
+// ================================================================
+// 0.5.2 用户第 6 条：多文件时底部只报「整批」的进度
+// ----------------------------------------------------------------
+// 用户原话：「最下面的传输任务进度条在传输多文件时不要不停的显示每一个文件的
+// 进度，而是显示整个多文件的进度」。
+//
+// 之前底部进度条读的是 jobs —— 而串行上传是「一个文件一个 job」，
+// 每换一个文件进度就从新开始，看着像是一直在刷当前这个文件。
+// 现在批次在跑时摘要是「正在上传 · N/M 个文件 · X%」，口径是整批。
+// ================================================================
+describe('0.5.2 第 6 条：多文件上传只报整批进度', () => {
+  function fileEntry(name, size) {
+    return {
+      isFile: true,
+      isDirectory: false,
+      name,
+      file(cb) { cb({ name, size, type: 'application/octet-stream' }) },
+    }
+  }
+
+  test('拖两个文件：底部摘要是整批（N/M 个文件），不是单个文件名', async () => {
+    const h = createHarness()
+    h.backend.items = []
+    const host = await h.mount()
+    const main = h.byClass(host, 'mc-exMain')[0]
+
+    h.xhrLog.length = 0
+    main.props.onDrop({
+      preventDefault() {}, stopPropagation() {},
+      dataTransfer: {
+        items: [
+          { kind: 'file', webkitGetAsEntry: () => fileEntry('one.bin', 500), getAsFile: () => ({ name: 'one.bin', size: 500 }) },
+          { kind: 'file', webkitGetAsEntry: () => fileEntry('two.bin', 1500), getAsFile: () => ({ name: 'two.bin', size: 1500 }) },
+        ],
+        files: [],
+      },
+    })
+    /**
+     * 🔴 0.5.3 修正：这条断言以前只盯「传的过程中」那一瞬间，
+     * 结果它其实是在给 bug 背书 —— 0.5.2 的 bug 正是**永远停在这一句**
+     * 「正在上传 · N/N 个文件 · 100%」上。
+     *
+     * 现在断言完整的生命周期：
+     *   ① 传的过程中（如果抓得到）文案是整批、且不含单个文件名；
+     *   ② 传完之后必须变成「完成」；
+     *   ③ 停留 + 褪色之后整条 bar 消失。
+     */
+    await h.settle(4)
+    h.renderTree()
+    const duringNode = h.byClass(h.renderTree(), 'mc-exTransSummary')[0]
+    if (duringNode) {
+      const during = (duringNode.children || []).flat(Infinity).join('')
+      if (/个文件/.test(during) && /正在上传/.test(during)) {
+        assert.match(during, /\d+\/\d+ 个文件/, '整批文案格式不对：' + during)
+        assert.ok(
+          !/one\.bin|two\.bin/.test(during),
+          '摘要里还在报单个文件名（用户就是嫌这个）：' + during,
+        )
+      }
+    }
+
+    // 传完之后：必须出现「完成」，不能还挂着「正在上传」
+    await h.settle(40)
+    h.renderTree()
+    const afterNode = h.byClass(h.renderTree(), 'mc-exTransSummary')[0]
+    if (afterNode) {
+      const after = (afterNode.children || []).flat(Infinity).join('')
+      assert.ok(!/正在上传/.test(after), '传完了还显示「正在上传」：' + after)
+      assert.match(after, /上传完成|完成/, '传完后没有显示完成：' + after)
+    }
+
+    // 再等过「停留 5 秒 + 褪色 1.6 秒」，bar 应该彻底消失
+    await new Promise((r) => setTimeout(r, 7200))
+    await h.settle(20)
+    assert.equal(
+      h.byClass(h.renderTree(), 'mc-exTransSummary').length,
+      0,
+      '进度条传完之后一直不消失',
+    )
+  })
+
+  test('批次百分比按字节算：大文件权重更高', async () => {
+    // 直接读源码里的算法，避免受假后端时序影响
+    const SRC = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+    const at = SRC.indexOf('function uploadBatchPercent()')
+    assert.ok(at > 0, '没有 uploadBatchPercent()')
+    const body = SRC.slice(at, at + 700)
+    assert.ok(body.includes('totalBytes'), '整批进度没有按字节算')
+    assert.ok(
+      body.includes('doneBytes') && body.includes('/ totalBytes'),
+      '整批进度不是 doneBytes / totalBytes：' + body.slice(0, 300),
+    )
+    // 拿不到字节时要退化按文件个数，不能卡在 0
+    assert.ok(/settled/.test(body), '没有按文件个数兜底')
+  })
+})
+
+// ================================================================
+// 0.5.3 第 2 条：收尾期间轮询反复刷新 jobs，也不能把收尾状态打回「进行中」
+// ----------------------------------------------------------------
+// 这是上一条的补充：根因是 effect 依赖 [jobs, uploadBatch]，
+// 轮询一秒刷一次 → effect 反复重跑。以前每跑一次都会
+// clearTimer() + setTransPhase(draw)，把 5 秒停留定时器杀掉。
+// ================================================================
+describe('0.5.3 第 2 条：收尾期间轮询不能把状态打回进行中', () => {
+  test('空闲时反复刷新，不该有残留的传输摘要', async () => {
+    const h = createHarness()
+    h.backend.items = []
+    await h.mount()
+
+    for (let i = 0; i < 8; i += 1) {
+      await h.settle(2)
+      h.renderTree()
+      await new Promise((r) => setTimeout(r, 60))
+    }
+
+    const bars = h.byClass(h.renderTree(), 'mc-exTransSummary')
+    assert.equal(bars.length, 0, '空闲状态下不该有传输摘要')
+  })
+})
+
+// ================================================================
+// 0.5.4：删除 / 移动之后，列表必须**立刻**反映结果（不需要手动点刷新）
+// ----------------------------------------------------------------
+// 用户原话：
+//   「删除文件需要手动刷新，否则那个文件不刷新的话会一直存在」
+//   「移动文件也是不刷新就不会出现在新的位置」
+// ================================================================
+describe('0.5.4：删除 / 移动之后列表必须立刻变', () => {
+  const rowsOf = (host) => host.filter(
+    (n) => String((n.props && n.props.className) || '').split(/\s+/).includes('mc-exRow'),
+  )
+  const namesOf = (host) => rowsOf(host).map((n) => JSON.stringify(n)).join('|')
+
+  test('删除单个文件：请求成功后该行立刻从列表消失', async () => {
+    const h = createHarness()
+    h.backend.items = [
+      { id: 'A', name: 'a.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'b.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    let host = await h.mount()
+    assert.equal(rowsOf(host).length, 2, '初始应有两行')
+
+    // 右键第一行 → 删除
+    const row = rowsOf(host)[0]
+    row.props.onContextMenu({
+      preventDefault() {}, stopPropagation() {},
+      clientX: 100, clientY: 100, currentTarget: makeElement('div'),
+    })
+    await h.settle(6)
+    host = h.renderTree()
+    const delBtn = host.find(
+      (n) => n.type === 'button' && /删除/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(delBtn, '右键菜单里没有删除')
+    h.calls.length = 0
+
+    /**
+     * 🔴 关键：把 /list 人为拖慢 400ms，然后在「刷新请求还在飞」的时刻检查界面。
+     *
+     * 用户要的是「不用刷新、也不用等，删掉就没了」。如果只有 reload()、
+     * 没有乐观更新，这个窗口里列表仍然是 2 行 —— 也就是他说的
+     * 「不刷新的话会一直存在」。把延迟打开之后，这条断言才能真正区分两种实现。
+     */
+    h.setListDelay(400)
+    delBtn.props.onMouseDown({ preventDefault() {}, stopPropagation() {} })
+    await h.settle(3)
+
+    const rightAfter = h.renderTree()
+    assert.equal(
+      rowsOf(rightAfter).length,
+      1,
+      '点删除之后界面没有立刻少一行（' + rowsOf(rightAfter).length + ' 行）—— ' +
+        '这就是「必须手动刷新才消失」',
+    )
+    assert.ok(
+      !rowsOf(rightAfter).some((n) => JSON.stringify(n).includes('a.txt')),
+      '被删的文件还留在列表里',
+    )
+
+    h.setListDelay(0)
+    await h.settle(24)
+    host = h.renderTree()
+
+    const removeCalls = h.calls.filter((c) => c.path.startsWith('/api/dsh-mcloud/remove'))
+    assert.ok(removeCalls.length >= 1, '没有发出 /remove')
+    const listCallsAfter = h.calls.filter((c) => c.path.startsWith('/api/dsh-mcloud/list'))
+    assert.ok(listCallsAfter.length >= 1, '删除成功后没有重新拉列表')
+    assert.equal(
+      rowsOf(host).length,
+      1,
+      '删完之后列表里还有 ' + rowsOf(host).length + ' 行（应该只剩 1 行）—— 必须手动刷新才消失',
+    )
+    assert.ok(!namesOf(host).includes('删除后不应在的'), '')
+  })
+
+  test('移动文件到别的文件夹：源目录里立刻消失', async () => {
+    const h = createHarness()
+    // ⚠️ /list 对根目录优先返回 backend.children['/']，所以这里两份都设成同一份数据
+    // （同一个数组引用），移动时假后端两边一起改，避免测试自己被数据不一致坑到。
+    const initial = [
+      { id: 'A', name: 'move-me.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'DEST', name: '目标', size: 0, type: 'folder', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    h.backend.items = initial
+    h.backend.children = { '/': initial }
+    let host = await h.mount()
+    assert.equal(rowsOf(host).length, 2, '初始应有两行')
+
+    const row = rowsOf(host).find((n) => JSON.stringify(n).includes('move-me.txt'))
+    assert.ok(row, '找不到要移动的文件行')
+    row.props.onContextMenu({
+      preventDefault() {}, stopPropagation() {},
+      clientX: 100, clientY: 100, currentTarget: makeElement('div'),
+    })
+    await h.settle(6)
+    host = h.renderTree()
+    const moveBtn = host.find(
+      (n) => n.type === 'button' && /转移到/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(moveBtn, '右键菜单里没有「转移」')
+    moveBtn.props.onMouseDown({ preventDefault() {}, stopPropagation() {} })
+    await h.settle(12)
+    host = h.renderTree()
+
+    // 选目标文件夹，然后确认
+    // 注意：外层 .mc-exTreeNode 只是容器，真正可点的是内层那个带 onClick 的
+    const destRows = host.filter(
+      (n) => String((n.props && n.props.className) || '').includes('mc-exTreeNode') &&
+        JSON.stringify(n).includes('目标'),
+    )
+    const destRow = destRows.find((n) => typeof (n.props && n.props.onClick) === 'function')
+    assert.ok(destRow, '转移面板里没有可点的目标文件夹节点')
+    destRow.props.onClick({ stopPropagation() {} })
+    await h.settle(10)
+    host = h.renderTree()
+    const confirmBtn = host.find(
+      (n) => n.type === 'button' && /(转移到|转移 1 项到)/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(confirmBtn, '底部没有确认按钮')
+    h.calls.length = 0
+    /**
+     * 同样把 /list 拖慢：要在「移动后的刷新还在飞」时检查源目录。
+     * 只有乐观更新能在这个窗口里就已经把文件摘掉。
+     */
+    h.setListDelay(400)
+    confirmBtn.props.onClick()
+    await h.settle(4)
+    const rightAfterMove = h.renderTree()
+    assert.ok(
+      !rowsOf(rightAfterMove).some((n) => JSON.stringify(n).includes('move-me.txt')),
+      '移动请求刚发出、刷新还没回来时，源目录里还能看到这个文件 —— ' +
+        '这就是「不刷新就不会出现在新的位置」',
+    )
+    h.setListDelay(0)
+    await h.settle(24)
+    host = h.renderTree()
+
+    const moveCalls = h.calls.filter((c) => c.path.startsWith('/api/dsh-mcloud/move'))
+    assert.ok(moveCalls.length >= 1, '没有发出 /move')
+    assert.ok(
+      !rowsOf(host).some((n) => JSON.stringify(n).includes('move-me.txt')),
+      '移动成功后源目录里还能看到这个文件 —— 必须手动刷新才消失',
+    )
+  })
+})
+
+// ================================================================
+// 0.5.4 补充：139 的索引滞后不能把刚删掉的行又拉回来
+// ----------------------------------------------------------------
+// 真实环境里 /remove 成功之后立刻 /list，服务端**很可能还返回那一项**
+// （0.4.x 就踩过「上传完第一页回空」，是同一类滞后）。
+// 如果没有压制，乐观更新刚摘掉、reload 又拉回来 —— 用户看到的还是「删了还在」。
+// ================================================================
+describe('0.5.4 补充：索引滞后不能把删掉的行拉回来', () => {
+  const rowsOf = (host) => host.filter(
+    (n) => String((n.props && n.props.className) || '').split(/\s+/).includes('mc-exRow'),
+  )
+
+  test('删完之后服务端仍返回该项（模拟滞后），界面上也绝不能复活', async () => {
+    const h = createHarness()
+    const stale = [
+      { id: 'A', name: 'stale.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'B', name: 'keep.txt', size: 2, type: 'file', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    h.backend.items = stale
+    h.backend.children = { '/': stale }
+    let host = await h.mount()
+    assert.equal(rowsOf(host).length, 2, '初始应有两行')
+
+    // 故意让 /remove **不真的删数据**：模拟「删除成功但索引还没跟上」
+    const originalItems = h.backend.items
+    h.backend.items = originalItems
+
+    const row = rowsOf(host)[0]
+    row.props.onContextMenu({
+      preventDefault() {}, stopPropagation() {},
+      clientX: 100, clientY: 100, currentTarget: makeElement('div'),
+    })
+    await h.settle(6)
+    host = h.renderTree()
+    const delBtn = host.find(
+      (n) => n.type === 'button' && /删除/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(delBtn, '右键菜单里没有删除')
+
+    // 把假后端的 /remove 变成「只回 ok、不动数据」= 索引滞后
+    const realFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      const path = String(url).replace(/^https?:\/\/[^/]+/, '')
+      if (path.startsWith('/api/dsh-mcloud/remove')) {
+        return {
+          ok: true, status: 200,
+          json: async () => ({ ok: true, removed: 1 }),
+          text: async () => JSON.stringify({ ok: true, removed: 1 }),
+        }
+      }
+      return realFetch(url, init)
+    }
+
+    delBtn.props.onMouseDown({ preventDefault() {}, stopPropagation() {} })
+    await h.settle(30)
+    host = h.renderTree()
+    globalThis.fetch = realFetch
+
+    assert.equal(
+      rowsOf(host).length,
+      1,
+      '服务端索引滞后把删掉的行又拉回来了（' + rowsOf(host).length + ' 行）—— ' +
+        '用户看到的就是「删了还在，得手动刷新」',
+    )
+    assert.ok(!rowsOf(host).some((n) => JSON.stringify(n).includes('stale.txt')), '被删的文件复活了')
+  })
+})
+
+// ================================================================
+// 0.5.5：转移要「点下确认就生效」，不能等 /batchMove 这个慢接口
+// ----------------------------------------------------------------
+// 用户原话：「转移文件大概需要七八秒才能转移到，优化时间能瞬间转移吗」。
+//
+// 根因：乐观更新写在 api.move(...).then() 里面，必须等请求返回才执行。
+// 139 的 batchMove 本身就要好几秒，于是界面一直卡着不动。
+// ================================================================
+describe('0.5.5：转移点下确认就立刻生效，不等 /move 返回', () => {
+  const rowsOf = (host) => host.filter(
+    (n) => String((n.props && n.props.className) || '').split(/\s+/).includes('mc-exRow'),
+  )
+
+  // 打开转移面板 → 选目标 → 返回确认按钮
+  async function openMoveAndPickDest(h, host, fileName, destName) {
+    const row = rowsOf(host).find((n) => JSON.stringify(n).includes(fileName))
+    assert.ok(row, '找不到 ' + fileName)
+    row.props.onContextMenu({
+      preventDefault() {}, stopPropagation() {},
+      clientX: 100, clientY: 100, currentTarget: makeElement('div'),
+    })
+    await h.settle(6)
+    host = h.renderTree()
+    const moveBtn = host.find(
+      (n) => n.type === 'button' && /转移到/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(moveBtn, '右键菜单里没有「转移到」')
+    moveBtn.props.onMouseDown({ preventDefault() {}, stopPropagation() {} })
+    await h.settle(12)
+    host = h.renderTree()
+
+    const destRows = host.filter(
+      (n) => String((n.props && n.props.className) || '').includes('mc-exTreeNode') &&
+        JSON.stringify(n).includes(destName),
+    )
+    const destRow = destRows.find((n) => typeof (n.props && n.props.onClick) === 'function')
+    assert.ok(destRow, '转移面板里没有目标文件夹')
+    destRow.props.onClick({ stopPropagation() {} })
+    await h.settle(10)
+    host = h.renderTree()
+    const confirmBtn = host.find(
+      (n) => n.type === 'button' && /(转移到|转移 1 项到)/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(confirmBtn, '没有确认按钮')
+    return { host, confirmBtn }
+  }
+
+  test('接口还在飞（模拟 3 秒）时，源目录里就已经没了、面板也已经关了', async () => {
+    const h = createHarness()
+    const initial = [
+      { id: 'A', name: 'slow-move.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'DEST', name: '目标', size: 0, type: 'folder', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    h.backend.items = initial
+    h.backend.children = { '/': initial }
+    const host0 = await h.mount()
+    const picked = await openMoveAndPickDest(h, host0, 'slow-move.txt', '目标')
+
+    // 让 /move 卡 3 秒：模拟用户说的「七八秒」那个慢接口
+    h.setMoveDelay(3000)
+    h.calls.length = 0
+    picked.confirmBtn.props.onClick()
+
+    // 只等极短时间：请求肯定还没回来
+    await h.settle(3)
+    const now = h.renderTree()
+
+    // ① 源目录里必须已经没有了
+    assert.ok(
+      !rowsOf(now).some((n) => JSON.stringify(n).includes('slow-move.txt')),
+      '点下确认之后源目录里还留着文件 —— 界面在等 /move 返回',
+    )
+    // ② 面板必须已经关了（不能让人盯着一个转圈弹层等七八秒）
+    assert.equal(
+      h.byClass(now, 'mc-movePanel').length,
+      0,
+      '转移面板还开着 —— 用户要等接口返回才能看到结果',
+    )
+    // ③ 请求确实已经发出去了（是「先生效再发请求」，不是「根本没发」）
+    const moveCalls = h.calls.filter((c) => c.path.startsWith('/api/dsh-mcloud/move'))
+    assert.ok(moveCalls.length >= 1, '根本没发出 /move')
+
+    h.setMoveDelay(0)
+    await h.settle(30)
+  })
+
+  test('转移失败：把文件放回原位，并明确提示', async () => {
+    const h = createHarness()
+    const initial = [
+      { id: 'A', name: 'will-fail.txt', size: 1, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'DEST', name: '目标', size: 0, type: 'folder', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    h.backend.items = initial
+    h.backend.children = { '/': initial }
+    const host0 = await h.mount()
+    const picked = await openMoveAndPickDest(h, host0, 'will-fail.txt', '目标')
+
+    // 让 /move 直接失败
+    const realFetch = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      const path = String(url).replace(/^https?:\/\/[^/]+/, '')
+      if (path.startsWith('/api/dsh-mcloud/move')) {
+        return {
+          ok: false, status: 400,
+          json: async () => ({ ok: false, error: '模拟失败' }),
+          text: async () => JSON.stringify({ ok: false, error: '模拟失败' }),
+        }
+      }
+      return realFetch(url, init)
+    }
+
+    picked.confirmBtn.props.onClick()
+    await h.settle(30)
+    const host = h.renderTree()
+    globalThis.fetch = realFetch
+
+    assert.ok(
+      rowsOf(host).some((n) => JSON.stringify(n).includes('will-fail.txt')),
+      '转移失败之后文件没有放回列表 —— 用户会以为文件丢了',
+    )
+  })
+})
+
+// ================================================================
+// 0.5.5 补充：移动完点进目标目录，文件应该**已经在那里**
+// ----------------------------------------------------------------
+// 只让「源目录消失」还不够：用户下一步一定是去看目标目录。
+// 如果那时又要等一次网络往返（而且 139 索引滞后可能还看不到），
+// 体验上仍然是「移了但看不见」。
+// ================================================================
+describe('0.5.5 补充：移动后点进目标目录，文件已经在里面（不用等接口）', () => {
+  const rowsOf = (host) => host.filter(
+    (n) => String((n.props && n.props.className) || '').split(/\s+/).includes('mc-exRow'),
+  )
+
+  test('确认移动后立刻进入目标目录：文件已经在列表里', async () => {
+    const h = createHarness()
+    const initial = [
+      { id: 'A', name: 'filed.txt', size: 7, type: 'file', updatedAt: '2026-11-01 10:00:00' },
+      { id: 'DEST', name: '目标', size: 0, type: 'folder', updatedAt: '2026-11-02 10:00:00' },
+    ]
+    h.backend.items = initial
+    h.backend.children = { '/': initial }
+    let host = await h.mount()
+
+    // 打开转移面板
+    const row = rowsOf(host).find((n) => JSON.stringify(n).includes('filed.txt'))
+    assert.ok(row, '找不到要移动的文件')
+    row.props.onContextMenu({
+      preventDefault() {}, stopPropagation() {},
+      clientX: 100, clientY: 100, currentTarget: makeElement('div'),
+    })
+    await h.settle(6)
+    host = h.renderTree()
+    const moveBtn = host.find(
+      (n) => n.type === 'button' && /转移到/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(moveBtn, '右键菜单里没有「转移到」')
+    moveBtn.props.onMouseDown({ preventDefault() {}, stopPropagation() {} })
+    await h.settle(12)
+    host = h.renderTree()
+
+    const destRows = host.filter(
+      (n) => String((n.props && n.props.className) || '').includes('mc-exTreeNode') &&
+        JSON.stringify(n).includes('目标'),
+    )
+    const destRow = destRows.find((n) => typeof (n.props && n.props.onClick) === 'function')
+    assert.ok(destRow, '转移面板里没有目标文件夹')
+    destRow.props.onClick({ stopPropagation() {} })
+    await h.settle(10)
+    host = h.renderTree()
+    const confirmBtn = host.find(
+      (n) => n.type === 'button' && /(转移到|转移 1 项到)/.test((n.children || []).flat().join('')),
+    )
+    assert.ok(confirmBtn, '没有确认按钮')
+
+    /**
+     * 让 /move 慢 3 秒，**同时**让 /list 也慢 1 秒。
+     *
+     * 只慢 /move 是不够的：假后端移动作业会立刻改动数据，进目标目录时
+     * reload 一下就把真数据拉到了，测不出「有没有预置缓存」。
+     * 把 /list 也拖慢，才能确认「点进去立刻就有」是靠本地预置而不是靠这次往返。
+     */
+    h.setMoveDelay(3000)
+    h.setListDelay(1000)
+    confirmBtn.props.onClick()
+    await h.settle(3)
+
+    /**
+     * 进入「目标」文件夹：直接在**列表里双击**那一行。
+     *
+     * 不用左树：左树节点要等展开才会渲染，测试里时机不稳；列表里的行更直接，
+     * 而且和用户真实操作路径一致（双击文件夹进入）。
+     */
+    host = h.renderTree()
+    const destFolderRow = rowsOf(host).find(
+      (n) => JSON.stringify(n).includes('目标') && typeof (n.props && n.props.onDoubleClick) === 'function',
+    )
+    assert.ok(destFolderRow, '根目录列表里没有「目标」文件夹行')
+    // 确认拿到的确实是**文件夹**那一行（文件行的双击是下载）
+    assert.ok(
+      JSON.stringify(destFolderRow).includes('📁'),
+      '拿到的不是文件夹行（双击会触发下载）：' + JSON.stringify(destFolderRow).slice(0, 200),
+    )
+
+    destFolderRow.props.onDoubleClick()
+    /**
+     * 假 React 的 effect 是在**下一次 renderTree()** 时按 deps 变化入队的，
+     * 所以顺序必须是：renderTree（触发 effect 入队）→ settle（跑 effect）。
+     * 只 settle 不 render 的话，parentId 变化那次拉取永远不会发出去。
+     */
+    h.renderTree()
+    await h.settle(12)
+    host = h.renderTree()
+    await h.settle(12)
+    host = h.renderTree()
+
+    // 确认真的切进了目标目录（面包屑里有「目标」）
+    assert.ok(
+      JSON.stringify(h.byClass(host, 'mc-crumbs')).includes('目标'),
+      '没切进目标目录（仍在根目录）',
+    )
+    assert.ok(
+      rowsOf(host).some((n) => JSON.stringify(n).includes('filed.txt')),
+      '点进目标目录后看不到刚移过去的文件（共 ' + rowsOf(host).length + ' 行）' +
+        ' —— 用户会以为移动失败了',
+    )
+
+    h.setMoveDelay(0)
+    h.setListDelay(0)
+    await h.settle(30)
   })
 })
